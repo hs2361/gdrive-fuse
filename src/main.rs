@@ -1,5 +1,4 @@
 use clap::{crate_version, Arg, ArgAction, Command};
-// use drive_v3::objects::File;
 use drive_v3::{Credentials, Drive};
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
@@ -9,53 +8,19 @@ use libc::ENOENT;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::time::{Duration, UNIX_EPOCH};
-mod filenode;
+
+mod filetree;
+use filetree::{FileNode, FileTree};
 
 const TTL: Duration = Duration::from_secs(1); // 1 second
 
-const HELLO_DIR_ATTR: FileAttr = FileAttr {
-    ino: 1,
-    size: 0,
-    blocks: 0,
-    atime: UNIX_EPOCH, // 1970-01-01 00:00:00
-    mtime: UNIX_EPOCH,
-    ctime: UNIX_EPOCH,
-    crtime: UNIX_EPOCH,
-    kind: FileType::Directory,
-    perm: 0o755,
-    nlink: 2,
-    uid: 501,
-    gid: 20,
-    rdev: 0,
-    flags: 0,
-    blksize: 512,
-};
-
 const HELLO_TXT_CONTENT: &str = "Hello World!\n";
 
-const HELLO_TXT_ATTR: FileAttr = FileAttr {
-    ino: 2,
-    size: 13,
-    blocks: 1,
-    atime: UNIX_EPOCH, // 1970-01-01 00:00:00
-    mtime: UNIX_EPOCH,
-    ctime: UNIX_EPOCH,
-    crtime: UNIX_EPOCH,
-    kind: FileType::RegularFile,
-    perm: 0o644,
-    nlink: 1,
-    uid: 501,
-    gid: 20,
-    rdev: 0,
-    flags: 0,
-    blksize: 512,
-};
+const DEFAULT_PARENT: &str = "My Drive";
 
 struct DriveFS {
     drive_client: Drive,
-    // inode_id_map: HashMap<String, String>,
-    file_tree_map: HashMap<String, Vec<String>>,
-    directory_ids: HashSet<String>,
+    file_tree: FileTree,
 }
 
 impl DriveFS {
@@ -66,11 +31,9 @@ impl DriveFS {
             .fields(
                 "files(name, parents, id, size, createdTime, modifiedTime, trashed, owned_by_me)",
             ) // Set what fields will be returned
-            // .q("name = 'Test Folder'")
+            .q("name = 'Test Folder' or name = 'Test Subfolder' or name = 'main.rs'")
             .execute()
             .unwrap();
-
-        dbg!(&file_list);
 
         let files = file_list.files.unwrap();
         let mut parent_ids = HashSet::<String>::new();
@@ -80,39 +43,97 @@ impl DriveFS {
         for file in &files {
             // file.created_time
             id_name_map.insert(file.id.clone().unwrap(), file.name.clone().unwrap());
-            parent_ids.extend(file.parents.clone().unwrap_or_default());
+            let file_parents = file.parents.clone().unwrap_or_default();
+            assert!(file_parents.len() <= 1, "File has more than 1 parent");
+            // println!(
+            //     "File has name: {} with parents: {:?}",
+            //     file.name.clone().unwrap(),
+            //     &file_parents
+            // );
+            parent_ids.extend(file_parents);
         }
-        let default_parent = "root".to_string();
+
+        let mut root_id = String::new();
+        for parent in &parent_ids {
+            if !id_name_map.contains_key(parent) {
+                root_id = parent.clone();
+                parent_ids.insert(root_id.clone());
+                break;
+            }
+        }
+
+        let root_node = FileNode::new(root_id, DEFAULT_PARENT.to_string());
+        let mut file_tree = FileTree::new(0);
+        file_tree.add_node(root_node, false);
 
         for file in &files {
-            // match &file.parents.clone() {
-            // Some(parents) => {
-            for parent in &file.parents.clone().unwrap_or(vec![default_parent.clone()]) {
+            for parent in &file
+                .parents
+                .clone()
+                .unwrap_or(vec![DEFAULT_PARENT.to_string()])
+            {
+                let file_id = &file.id.clone().unwrap();
                 let file_name = &file.name.clone().unwrap();
-                if !parent_ids.contains(parent) {
-                    file_tree_map.insert(file_name.clone(), Vec::<String>::new());
-                } else {
-                    let parent_name = id_name_map.get(parent).unwrap_or(&default_parent);
-                    if file_tree_map.contains_key(parent_name) {
-                        file_tree_map
-                            .get_mut(parent_name)
-                            .unwrap()
-                            .push(file_name.clone());
-                    } else {
-                        file_tree_map.insert(parent_name.clone(), vec![file_name.clone()]);
+
+                let mut this_node_exists = false;
+                let mut this_node_index: usize = 0;
+                if let Some(idx) = &file_tree.find_node_index(&file_id) {
+                    this_node_index = *idx;
+                    this_node_exists = true;
+                }
+
+                if parent_ids.contains(parent) {
+                    if !this_node_exists {
+                        let node = FileNode::new(file_id.clone(), file_name.clone());
+                        this_node_index = file_tree.add_node(node, false);
                     }
+                    if let Some(parent_node) = file_tree.find_node_mut(parent) {
+                        println!(
+                            "Appending child node with name: {} to existing parent with name: {}",
+                            file_name,
+                            id_name_map
+                                .get(parent)
+                                .unwrap_or(&DEFAULT_PARENT.to_string())
+                        );
+                        parent_node.add_child(this_node_index);
+                    } else {
+                        println!(
+                            "Could not find existing parent with ID: {} and name: {}",
+                            parent.clone(),
+                            id_name_map
+                                .get(parent)
+                                .unwrap_or(&DEFAULT_PARENT.to_string())
+                        );
+                        println!(
+                            "Creating new parent node with name: {} and child node: {}",
+                            id_name_map
+                                .get(parent)
+                                .unwrap_or(&DEFAULT_PARENT.to_string()),
+                            file_name,
+                        );
+                        let parent_name = id_name_map
+                            .get(parent)
+                            .unwrap_or(&DEFAULT_PARENT.to_string())
+                            .clone();
+                        let mut parent_node = FileNode::new(parent.clone(), parent_name);
+                        parent_node.add_child(this_node_index);
+                        file_tree.add_node(parent_node, false);
+                    }
+                } else if !this_node_exists {
+                    let node = FileNode::new(file_id.clone(), file_name.clone());
+                    file_tree.add_node(node, true);
+                    println!(
+                        "Added leaf node with ID: {} and name: {}",
+                        file_id, file_name
+                    );
                 }
             }
-            // }
-            // None => {}
-            // }
         }
+        println!("Found {} files and folders", file_tree.len());
 
-        dbg!(&file_tree_map);
         DriveFS {
             drive_client,
-            file_tree_map,
-            directory_ids: parent_ids,
+            file_tree,
         }
     }
 }
@@ -125,21 +146,70 @@ impl Filesystem for DriveFS {
             name.to_str().unwrap()
         );
 
-        if parent == 1 && name.to_str() == Some("hello.txt") {
-            reply.entry(&TTL, &HELLO_TXT_ATTR, 0);
-        } else {
-            println!("Returning ENOENT for lookup req");
-            reply.error(ENOENT);
+        if let Some(parent_node) = self.file_tree.get_node_at((parent - 1) as usize) {
+            for &child_index in &parent_node.children {
+                let child_node = self.file_tree.get_node_at(child_index).unwrap();
+                if child_node.name == name.to_str().unwrap() {
+                    let mut file_type = FileType::RegularFile;
+                    if child_node.children.len() > 0 {
+                        file_type = FileType::Directory;
+                    }
+                    println!("Inode {} - Name {}", &child_index, &child_node.name);
+                    let node_attr = FileAttr {
+                        ino: (child_index + 1) as u64,
+                        size: 1000,
+                        blocks: 1,
+                        atime: UNIX_EPOCH, // 1970-01-01 00:00:00
+                        mtime: UNIX_EPOCH,
+                        ctime: UNIX_EPOCH,
+                        crtime: UNIX_EPOCH,
+                        kind: file_type,
+                        perm: 0o644,
+                        nlink: 0,
+                        uid: 1000,
+                        gid: 1000,
+                        rdev: 0,
+                        flags: 0,
+                        blksize: 512,
+                    };
+                    reply.entry(&TTL, &node_attr, 0);
+                    return;
+                }
+            }
         }
+        println!("Returning ENOENT for lookup req");
+        reply.error(ENOENT)
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
         println!("getattr for {} ino", ino);
-        match ino {
-            1 => reply.attr(&TTL, &HELLO_DIR_ATTR),
-            2 => reply.attr(&TTL, &HELLO_TXT_ATTR),
-            _ => reply.error(ENOENT),
+        if let Some(node) = self.file_tree.get_node_at((ino + 1) as usize) {
+            let mut file_type = FileType::RegularFile;
+            if node.children.len() > 0 {
+                file_type = FileType::Directory;
+            }
+            let node_attr = FileAttr {
+                ino: ino,
+                size: 1000,
+                blocks: 1,
+                atime: UNIX_EPOCH, // 1970-01-01 00:00:00
+                mtime: UNIX_EPOCH,
+                ctime: UNIX_EPOCH,
+                crtime: UNIX_EPOCH,
+                kind: file_type,
+                perm: 0o644,
+                nlink: 0,
+                uid: 1000,
+                gid: 1000,
+                rdev: 0,
+                flags: 0,
+                blksize: 512,
+            };
+            reply.attr(&TTL, &node_attr);
+            return;
         }
+        println!("Returning ENOENT for getattr req");
+        reply.error(ENOENT)
     }
 
     fn read(
@@ -169,36 +239,31 @@ impl Filesystem for DriveFS {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        if ino != 1 {
-            println!("readdir for {} ino, returning ENOENT", ino);
-            reply.error(ENOENT);
-            return;
-        }
-
         println!("readdir for {} ino", ino);
-
-        // self.drive.
-
         let mut entries: Vec<(u64, FileType, String)> = vec![
             (1, FileType::Directory, String::from(".")),
             (1, FileType::Directory, String::from("..")),
         ];
 
-        entries.extend(
-            self.file_tree_map
-                .iter()
-                .enumerate()
-                .map(|(i, (file, children))| {
+        if let Some(node) = self.file_tree.get_node_at((ino - 1) as usize) {
+            for child_index in &node.children {
+                if let Some(child_node) = self.file_tree.get_node_at(*child_index) {
                     let mut file_type = FileType::RegularFile;
-                    if children.len() > 0 {
+                    if child_node.children.len() > 0 {
                         file_type = FileType::Directory;
                     }
-                    ((i + 2) as u64, file_type, file.clone())
-                }),
-        );
+                    entries.push((
+                        (*child_index + 1) as u64,
+                        file_type,
+                        child_node.name.clone(),
+                    ))
+                }
+            }
+        }
 
         for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
             // i + 1 means the index of the next entry
+            println!("Inode {} - Name {}", &entry.0, &entry.2);
             if reply.add(entry.0, (i + 1) as i64, entry.1, entry.2) {
                 break;
             }
@@ -208,9 +273,9 @@ impl Filesystem for DriveFS {
 }
 
 fn main() {
-    let matches = Command::new("hello")
+    let matches = Command::new("gdrivefs")
         .version(crate_version!())
-        .author("Christopher Berner")
+        .author("Harsh Sharma")
         .arg(
             Arg::new("MOUNT_POINT")
                 .required(true)
