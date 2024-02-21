@@ -10,12 +10,10 @@ use std::ffi::OsStr;
 use std::time::{Duration, UNIX_EPOCH};
 
 mod filetree;
-use filetree::{FileNode, FileTree};
+use filetree::{FileMetadata, FileNode, FileTree};
 
 const TTL: Duration = Duration::from_secs(1); // 1 second
-
 const HELLO_TXT_CONTENT: &str = "Hello World!\n";
-
 const DEFAULT_PARENT: &str = "My Drive";
 
 struct DriveFS {
@@ -29,7 +27,7 @@ impl DriveFS {
             .files
             .list()
             .fields(
-                "files(name, parents, id, size, createdTime, modifiedTime, trashed, owned_by_me)",
+                "files(name, parents, id, size, viewedByMeTime, createdTime, modifiedTime, trashed, owned_by_me)",
             ) // Set what fields will be returned
             .q("name = 'Test Folder' or name = 'Test Subfolder' or name = 'main.rs'")
             .execute()
@@ -37,20 +35,24 @@ impl DriveFS {
 
         let files = file_list.files.unwrap();
         let mut parent_ids = HashSet::<String>::new();
+        let mut parent_metadata_map = HashMap::<String, FileMetadata>::new();
         let mut id_name_map = HashMap::<String, String>::new();
-        let mut file_tree_map = HashMap::<String, Vec<String>>::new();
 
         for file in &files {
-            // file.created_time
             id_name_map.insert(file.id.clone().unwrap(), file.name.clone().unwrap());
             let file_parents = file.parents.clone().unwrap_or_default();
             assert!(file_parents.len() <= 1, "File has more than 1 parent");
-            // println!(
-            //     "File has name: {} with parents: {:?}",
-            //     file.name.clone().unwrap(),
-            //     &file_parents
-            // );
             parent_ids.extend(file_parents);
+        }
+
+        // Hack to avoid implementing topological sort
+        // ideally we should be traversing the nodes in topologically sorted order
+        // so that parent directories get created first
+        for file in &files {
+            let file_id = &file.id.clone().unwrap();
+            if parent_ids.contains(file_id) {
+                parent_metadata_map.insert(file_id.to_string(), FileMetadata::from(file));
+            }
         }
 
         let mut root_id = String::new();
@@ -62,7 +64,14 @@ impl DriveFS {
             }
         }
 
-        let root_node = FileNode::new(root_id, DEFAULT_PARENT.to_string());
+        let root_metadata = FileMetadata {
+            name: DEFAULT_PARENT.to_string(),
+            size: 0,
+            creation_time: UNIX_EPOCH,
+            access_time: UNIX_EPOCH,
+            last_modified_time: UNIX_EPOCH,
+        };
+        let root_node = FileNode::new(root_id, root_metadata);
         let mut file_tree = FileTree::new(0);
         file_tree.add_node(root_node, false);
 
@@ -84,7 +93,8 @@ impl DriveFS {
 
                 if parent_ids.contains(parent) {
                     if !this_node_exists {
-                        let node = FileNode::new(file_id.clone(), file_name.clone());
+                        let metadata = FileMetadata::from(file);
+                        let node = FileNode::new(file_id.clone(), metadata);
                         this_node_index = file_tree.add_node(node, false);
                     }
                     if let Some(parent_node) = file_tree.find_node_mut(parent) {
@@ -115,12 +125,17 @@ impl DriveFS {
                             .get(parent)
                             .unwrap_or(&DEFAULT_PARENT.to_string())
                             .clone();
-                        let mut parent_node = FileNode::new(parent.clone(), parent_name);
+                        let parent_metadata = parent_metadata_map
+                            .get(parent)
+                            .unwrap_or(&FileMetadata::default(parent_name))
+                            .clone();
+                        let mut parent_node = FileNode::new(parent.clone(), parent_metadata);
                         parent_node.add_child(this_node_index);
                         file_tree.add_node(parent_node, false);
                     }
                 } else if !this_node_exists {
-                    let node = FileNode::new(file_id.clone(), file_name.clone());
+                    let metadata = FileMetadata::from(file);
+                    let node = FileNode::new(file_id.clone(), metadata);
                     file_tree.add_node(node, true);
                     println!(
                         "Added leaf node with ID: {} and name: {}",
@@ -149,20 +164,23 @@ impl Filesystem for DriveFS {
         if let Some(parent_node) = self.file_tree.get_node_at((parent - 1) as usize) {
             for &child_index in &parent_node.children {
                 let child_node = self.file_tree.get_node_at(child_index).unwrap();
-                if child_node.name == name.to_str().unwrap() {
+                if child_node.metadata.name == name.to_str().unwrap() {
                     let mut file_type = FileType::RegularFile;
                     if child_node.children.len() > 0 {
                         file_type = FileType::Directory;
                     }
-                    println!("Inode {} - Name {}", &child_index, &child_node.name);
+                    println!(
+                        "Inode {} - Name {}",
+                        &child_index, &child_node.metadata.name
+                    );
                     let node_attr = FileAttr {
                         ino: (child_index + 1) as u64,
-                        size: 1000,
+                        size: child_node.metadata.size,
                         blocks: 1,
-                        atime: UNIX_EPOCH, // 1970-01-01 00:00:00
-                        mtime: UNIX_EPOCH,
-                        ctime: UNIX_EPOCH,
-                        crtime: UNIX_EPOCH,
+                        atime: child_node.metadata.access_time, // 1970-01-01 00:00:00
+                        mtime: child_node.metadata.last_modified_time,
+                        ctime: child_node.metadata.last_modified_time,
+                        crtime: child_node.metadata.creation_time,
                         kind: file_type,
                         perm: 0o644,
                         nlink: 0,
@@ -190,12 +208,12 @@ impl Filesystem for DriveFS {
             }
             let node_attr = FileAttr {
                 ino: ino,
-                size: 1000,
+                size: node.metadata.size,
                 blocks: 1,
-                atime: UNIX_EPOCH, // 1970-01-01 00:00:00
-                mtime: UNIX_EPOCH,
-                ctime: UNIX_EPOCH,
-                crtime: UNIX_EPOCH,
+                atime: node.metadata.access_time, // 1970-01-01 00:00:00
+                mtime: node.metadata.last_modified_time,
+                ctime: node.metadata.last_modified_time,
+                crtime: node.metadata.creation_time,
                 kind: file_type,
                 perm: 0o644,
                 nlink: 0,
@@ -255,7 +273,7 @@ impl Filesystem for DriveFS {
                     entries.push((
                         (*child_index + 1) as u64,
                         file_type,
-                        child_node.name.clone(),
+                        child_node.metadata.name.clone(),
                     ))
                 }
             }

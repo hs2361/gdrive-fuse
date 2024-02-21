@@ -1,16 +1,69 @@
 // Arena allocator based k-ary file tree implementation generalized from https://sachanganesh.com/programming/graph-tree-traversals-in-rust/
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use chrono::DateTime;
+use drive_v3::objects::File;
+
+fn rfc3339_to_system_time(date_time: &str) -> SystemTime {
+    SystemTime::from(DateTime::parse_from_rfc3339(date_time).unwrap_or(DateTime::UNIX_EPOCH.into()))
+}
+
+#[derive(Debug, Clone)]
+pub struct FileMetadata {
+    pub name: String,
+    pub size: u64,
+    pub creation_time: SystemTime,
+    pub access_time: SystemTime,
+    pub last_modified_time: SystemTime,
+}
+
+impl FileMetadata {
+    pub fn default(file_name: String) -> FileMetadata {
+        FileMetadata {
+            name: file_name,
+            size: 0,
+            creation_time: UNIX_EPOCH,
+            access_time: UNIX_EPOCH,
+            last_modified_time: UNIX_EPOCH,
+        }
+    }
+}
+
+impl From<&File> for FileMetadata {
+    fn from(value: &File) -> Self {
+        FileMetadata {
+            name: value.name.clone().unwrap_or_default(),
+            size: value
+                .size
+                .clone()
+                .unwrap_or(String::from("0"))
+                .parse::<u64>()
+                .unwrap_or_default(),
+            creation_time: rfc3339_to_system_time(
+                value.created_time.clone().unwrap_or_default().as_str(),
+            ),
+            access_time: rfc3339_to_system_time(
+                value.viewed_by_me_time.clone().unwrap_or_default().as_str(),
+            ),
+            last_modified_time: rfc3339_to_system_time(
+                value.modified_time.clone().unwrap_or_default().as_str(),
+            ),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct FileNode {
     id: String,
-    pub name: String,
+    pub metadata: FileMetadata,
     pub children: Vec<usize>,
 }
 
 impl FileNode {
-    pub fn new(id: String, name: String) -> Self {
+    pub fn new(id: String, metadata: FileMetadata) -> Self {
         FileNode {
             id,
-            name,
+            metadata,
             children: vec![],
         }
     }
