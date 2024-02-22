@@ -171,7 +171,8 @@ impl Filesystem for DriveFS {
                     }
                     println!(
                         "Inode {} - Name {}",
-                        &child_index, &child_node.metadata.name
+                        &(child_index + 1),
+                        &child_node.metadata.name
                     );
                     let node_attr = FileAttr {
                         ino: (child_index + 1) as u64,
@@ -201,7 +202,7 @@ impl Filesystem for DriveFS {
 
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
         println!("getattr for {} ino", ino);
-        if let Some(node) = self.file_tree.get_node_at((ino + 1) as usize) {
+        if let Some(node) = self.file_tree.get_node_at((ino - 1) as usize) {
             let mut file_type = FileType::RegularFile;
             if node.children.len() > 0 {
                 file_type = FileType::Directory;
@@ -241,10 +242,17 @@ impl Filesystem for DriveFS {
         _lock: Option<u64>,
         reply: ReplyData,
     ) {
-        if ino == 2 {
-            reply.data(&HELLO_TXT_CONTENT.as_bytes()[offset as usize..]);
+        println!("read for {} ino", ino);
+        if let Some(node) = self.file_tree.get_node_at((ino - 1) as usize) {
+            let file_bytes = self
+                .drive_client
+                .files
+                .get_media(node.id.clone())
+                .execute()
+                .unwrap();
+            reply.data(&file_bytes[offset as usize..]);
         } else {
-            println!("read for {} ino, returning ENOENT", ino);
+            println!("Returning ENOENT for read req");
             reply.error(ENOENT);
         }
     }

@@ -54,7 +54,7 @@ impl From<&File> for FileMetadata {
 
 #[derive(Debug)]
 pub struct FileNode {
-    id: String,
+    pub id: String,
     pub metadata: FileMetadata,
     pub children: Vec<usize>,
 }
