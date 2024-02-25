@@ -1,39 +1,61 @@
 use clap::{crate_version, Arg, ArgAction, Command};
+use drive_v3::objects::File;
 use drive_v3::{Credentials, Drive};
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
     Request,
 };
-use libc::ENOENT;
+use libc::{ENAVAIL, ENOENT};
+use std::cmp::min;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
+use std::os::unix::fs::FileExt;
 use std::time::{Duration, UNIX_EPOCH};
+use std::vec;
 
 mod filetree;
+mod lfu_cache;
 use filetree::{FileMetadata, FileNode, FileTree};
+use lfu_cache::LFUFileCache;
 
-const TTL: Duration = Duration::from_secs(1); // 1 second
-const HELLO_TXT_CONTENT: &str = "Hello World!\n";
+const TTL: Duration = Duration::from_secs(60); // 1 second
 const DEFAULT_PARENT: &str = "My Drive";
+const MAX_PAGE_SIZE: i64 = 1000;
+const CACHE_CAPACITY: usize = 5;
 
 struct DriveFS {
     drive_client: Drive,
     file_tree: FileTree,
+    file_cache: LFUFileCache,
+}
+
+fn get_all_files(drive_client: &Drive) -> Vec<File> {
+    let mut next_page_token = Some(String::new());
+    let mut file_list: Vec<File> = vec![];
+
+    while next_page_token.is_some() {
+        let response = drive_client
+            .files
+            .list()
+            .include_items_from_all_drives(false)
+            .page_token(next_page_token.unwrap())
+            .page_size(MAX_PAGE_SIZE)
+            .fields(
+                "nextPageToken,files(name, parents, id, size, viewedByMeTime, createdTime, modifiedTime, trashed, owned_by_me)",
+            ) // Set what fields will be returned
+            // .q("name = 'Test Folder' or name = 'Test Subfolder' or name = 'main.rs'")
+            .execute()
+            .unwrap();
+        next_page_token = response.next_page_token;
+        file_list.extend(response.files.unwrap());
+    }
+
+    file_list
 }
 
 impl DriveFS {
     fn new(drive_client: Drive) -> DriveFS {
-        let file_list = drive_client
-            .files
-            .list()
-            .fields(
-                "files(name, parents, id, size, viewedByMeTime, createdTime, modifiedTime, trashed, owned_by_me)",
-            ) // Set what fields will be returned
-            .q("name = 'Test Folder' or name = 'Test Subfolder' or name = 'main.rs'")
-            .execute()
-            .unwrap();
-
-        let files = file_list.files.unwrap();
+        let files = get_all_files(&drive_client);
         let mut parent_ids = HashSet::<String>::new();
         let mut parent_metadata_map = HashMap::<String, FileMetadata>::new();
         let mut id_name_map = HashMap::<String, String>::new();
@@ -74,6 +96,7 @@ impl DriveFS {
         let root_node = FileNode::new(root_id, root_metadata);
         let mut file_tree = FileTree::new(0);
         file_tree.add_node(root_node, false);
+        // println!("{}", &files.len());
 
         for file in &files {
             for parent in &file
@@ -98,29 +121,29 @@ impl DriveFS {
                         this_node_index = file_tree.add_node(node, false);
                     }
                     if let Some(parent_node) = file_tree.find_node_mut(parent) {
-                        println!(
-                            "Appending child node with name: {} to existing parent with name: {}",
-                            file_name,
-                            id_name_map
-                                .get(parent)
-                                .unwrap_or(&DEFAULT_PARENT.to_string())
-                        );
+                        // println!(
+                        //     "Appending child node with name: {} to existing parent with name: {}",
+                        //     file_name,
+                        //     id_name_map
+                        //         .get(parent)
+                        //         .unwrap_or(&DEFAULT_PARENT.to_string())
+                        // );
                         parent_node.add_child(this_node_index);
                     } else {
-                        println!(
-                            "Could not find existing parent with ID: {} and name: {}",
-                            parent.clone(),
-                            id_name_map
-                                .get(parent)
-                                .unwrap_or(&DEFAULT_PARENT.to_string())
-                        );
-                        println!(
-                            "Creating new parent node with name: {} and child node: {}",
-                            id_name_map
-                                .get(parent)
-                                .unwrap_or(&DEFAULT_PARENT.to_string()),
-                            file_name,
-                        );
+                        // println!(
+                        //     "Could not find existing parent with ID: {} and name: {}",
+                        //     parent.clone(),
+                        //     id_name_map
+                        //         .get(parent)
+                        //         .unwrap_or(&DEFAULT_PARENT.to_string())
+                        // );
+                        // println!(
+                        //     "Creating new parent node with name: {} and child node: {}",
+                        //     id_name_map
+                        //         .get(parent)
+                        //         .unwrap_or(&DEFAULT_PARENT.to_string()),
+                        //     file_name,
+                        // );
                         let parent_name = id_name_map
                             .get(parent)
                             .unwrap_or(&DEFAULT_PARENT.to_string())
@@ -137,10 +160,10 @@ impl DriveFS {
                     let metadata = FileMetadata::from(file);
                     let node = FileNode::new(file_id.clone(), metadata);
                     file_tree.add_node(node, true);
-                    println!(
-                        "Added leaf node with ID: {} and name: {}",
-                        file_id, file_name
-                    );
+                    // println!(
+                    //     "Added leaf node with ID: {} and name: {}",
+                    //     file_id, file_name
+                    // );
                 }
             }
         }
@@ -149,6 +172,11 @@ impl DriveFS {
         DriveFS {
             drive_client,
             file_tree,
+            file_cache: LFUFileCache::with_capacity(
+                "/home/harsh/.drivefs/".to_string(),
+                CACHE_CAPACITY,
+            )
+            .unwrap(),
         }
     }
 }
@@ -237,20 +265,42 @@ impl Filesystem for DriveFS {
         ino: u64,
         _fh: u64,
         offset: i64,
-        _size: u32,
+        size: u32,
         _flags: i32,
         _lock: Option<u64>,
         reply: ReplyData,
     ) {
-        println!("read for {} ino", ino);
+        println!(
+            "read for {} ino with offset: {} and size {}",
+            ino, offset, size
+        );
         if let Some(node) = self.file_tree.get_node_at((ino - 1) as usize) {
-            let file_bytes = self
-                .drive_client
-                .files
-                .get_media(node.id.clone())
-                .execute()
-                .unwrap();
-            reply.data(&file_bytes[offset as usize..]);
+            if let Some(cached_file) = self.file_cache.get(&node.id, true) {
+                println!("Cache hit for ID {}", node.id);
+                let file_size = cached_file.metadata().unwrap().len();
+                let offset = offset as u64;
+                let buf_size = min(size as usize, (file_size - offset) as usize);
+                let mut buffer = vec![0; buf_size];
+                cached_file.read_exact_at(&mut buffer, offset).unwrap();
+                reply.data(&buffer);
+                return;
+            } else {
+                println!("Cache miss for ID {}", node.id);
+                let result = self.drive_client.files.get_media(node.id.clone()).execute();
+                match result {
+                    Ok(file_bytes) => {
+                        self.file_cache.set(node.id.clone(), file_bytes.clone());
+                        println!("Inserted cache entry for {}", node.id);
+                        let start = offset as usize;
+                        let end = min(start + 1 + size as usize, file_bytes.len());
+                        reply.data(&file_bytes[start..end]);
+                    }
+                    Err(err) => {
+                        println!("Failed to download file: {}", err.to_string());
+                        reply.error(ENAVAIL);
+                    }
+                }
+            }
         } else {
             println!("Returning ENOENT for read req");
             reply.error(ENOENT);
@@ -265,7 +315,7 @@ impl Filesystem for DriveFS {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        println!("readdir for {} ino", ino);
+        println!("readdir for {} ino with offset {}", ino, offset);
         let mut entries: Vec<(u64, FileType, String)> = vec![
             (1, FileType::Directory, String::from(".")),
             (1, FileType::Directory, String::from("..")),
@@ -287,10 +337,10 @@ impl Filesystem for DriveFS {
             }
         }
 
-        for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
+        for entry in entries.into_iter().skip(offset as usize) {
             // i + 1 means the index of the next entry
             println!("Inode {} - Name {}", &entry.0, &entry.2);
-            if reply.add(entry.0, (i + 1) as i64, entry.1, entry.2) {
+            if reply.add(entry.0, (entry.0 + 1) as i64, entry.1, entry.2) {
                 break;
             }
         }

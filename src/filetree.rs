@@ -72,9 +72,9 @@ impl FileNode {
         self.children.push(index);
     }
 
-    pub fn delete_child(&mut self, index: usize) {
-        self.children.swap_remove(index);
-    }
+    // pub fn delete_child(&mut self, index: usize) {
+    //     self.children.swap_remove(index);
+    // }
 }
 
 pub struct FileTree {
