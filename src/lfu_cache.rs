@@ -1,15 +1,17 @@
-// LFU file based cache implemenation adapted from https://github.com/NavyaZaveri/lfu-cache
+// LFU file based cache implementation adapted from https://github.com/NavyaZaveri/lfu-cache
+// https://ieftimov.com/posts/when-why-least-frequently-used-cache-implementation-golang/
 use linked_hash_set::LinkedHashSet;
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Serialize};
+use serde_json;
 use std::borrow::Borrow;
-use std::collections::hash_map::{IntoIter, Iter};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fs::{remove_file, write, File, OpenOptions};
-use std::ops::Index;
 use std::path::Path;
-use std::rc::Rc;
+use std::sync::Arc;
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct CacheEntry {
     value: String,
     frequency: usize,
@@ -23,8 +25,8 @@ impl CacheEntry {
 
 #[derive(Debug)]
 pub struct LFUFileCache {
-    cache: HashMap<Rc<String>, CacheEntry>,
-    frequency_bin: HashMap<usize, LinkedHashSet<Rc<String>>>,
+    cache: HashMap<Arc<String>, CacheEntry>,
+    frequency_bin: HashMap<usize, LinkedHashSet<Arc<String>>>,
     capacity: usize,
     min_frequency: usize,
     cache_dir: String,
@@ -44,6 +46,11 @@ impl LFUFileCache {
         })
     }
 
+    pub fn save_state(&self) {
+        let file_path = Path::new(&self.cache_dir).join("cache_state.json");
+        serde_json::to_writer(File::create(file_path).unwrap(), &self).unwrap();
+    }
+
     pub fn contains(&self, key: &String) -> bool {
         return self.cache.contains_key(key);
     }
@@ -54,13 +61,13 @@ impl LFUFileCache {
 
     pub fn remove(&mut self, key: String) -> bool {
         let file_path = Path::new(&self.cache_dir).join(key.clone());
-        let key_rc = Rc::new(key);
-        if let Some(value_counter) = self.cache.get(&Rc::clone(&key_rc)) {
+        let key_rc = Arc::new(key);
+        if let Some(value_counter) = self.cache.get(&Arc::clone(&key_rc)) {
             let count = value_counter.frequency;
             self.frequency_bin
                 .entry(count)
                 .or_default()
-                .remove(&Rc::clone(&key_rc));
+                .remove(&Arc::clone(&key_rc));
             self.cache.remove(&key_rc);
             remove_file(file_path).unwrap();
         }
@@ -71,8 +78,8 @@ impl LFUFileCache {
     /// Method marked as mutable because it internally updates the frequency of the accessed key
     pub fn get(&mut self, key: &String, read_only: bool) -> Option<File> {
         let file_path = Path::new(&self.cache_dir).join(key.clone());
-        let key = self.cache.get_key_value(key).map(|(r, _)| Rc::clone(r))?;
-        self.update_frequency_bin(Rc::clone(&key));
+        let key = self.cache.get_key_value(key).map(|(r, _)| Arc::clone(r))?;
+        self.update_frequency_bin(Arc::clone(&key));
         if self.cache.contains_key(&key) {
             return Some(
                 OpenOptions::new()
@@ -85,7 +92,7 @@ impl LFUFileCache {
         None
     }
 
-    fn update_frequency_bin(&mut self, key: Rc<String>) {
+    fn update_frequency_bin(&mut self, key: Arc<String>) {
         let entry = self.cache.get_mut(&key).unwrap();
         let bin = self.frequency_bin.get_mut(&entry.frequency).unwrap();
         bin.remove(&key);
@@ -106,19 +113,19 @@ impl LFUFileCache {
         remove_file(file_path).unwrap();
     }
 
-    pub fn iter(&self) -> LfuIterator {
-        LfuIterator {
-            values: self.cache.iter(),
-        }
-    }
+    // pub fn iter(&self) -> LfuIterator {
+    //     LfuIterator {
+    //         values: self.cache.iter(),
+    //     }
+    // }
 
     pub fn set(&mut self, key: String, data: Vec<u8>) {
         let key_copy = key.clone();
         let file_path = Path::new(&self.cache_dir).join(&key_copy);
-        let key_rc = Rc::new(key);
+        let key_rc = Arc::new(key);
         if self.cache.contains_key(&key_rc) {
             write(&file_path, data).unwrap();
-            self.update_frequency_bin(Rc::clone(&key_rc));
+            self.update_frequency_bin(Arc::clone(&key_rc));
             return;
         }
         if self.len() >= self.capacity {
@@ -126,7 +133,7 @@ impl LFUFileCache {
         }
         write(&file_path, data.clone()).unwrap();
         self.cache.insert(
-            Rc::clone(&key_rc),
+            Arc::clone(&key_rc),
             CacheEntry {
                 value: key_copy,
                 frequency: 1,
@@ -140,56 +147,24 @@ impl LFUFileCache {
     }
 }
 
-pub struct LfuIterator<'a> {
-    values: Iter<'a, Rc<String>, CacheEntry>,
-}
+impl Serialize for LFUFileCache {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("LFUFileCache", 5)?;
 
-pub struct LfuConsumer {
-    values: IntoIter<Rc<String>, CacheEntry>,
-}
+        let serializable_freq_bin: HashMap<&usize, Vec<&Arc<String>>> = self
+            .frequency_bin
+            .iter()
+            .map(|item| (item.0, Vec::from_iter(item.1)))
+            .collect();
 
-impl Iterator for LfuConsumer {
-    type Item = (Rc<String>, String);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.values.next().map(|(k, v)| (k, v.value))
-    }
-}
-
-impl IntoIterator for LFUFileCache {
-    type Item = (Rc<String>, String);
-    type IntoIter = LfuConsumer;
-
-    fn into_iter(self) -> Self::IntoIter {
-        return LfuConsumer {
-            values: self.cache.into_iter(),
-        };
-    }
-}
-
-impl<'a> Iterator for LfuIterator<'a> {
-    type Item = (Rc<String>, &'a String);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.values
-            .next()
-            .map(|(rc, vc)| (Rc::clone(rc), &vc.value))
-    }
-}
-
-impl<'a> IntoIterator for &'a LFUFileCache {
-    type Item = (Rc<String>, &'a String);
-
-    type IntoIter = LfuIterator<'a>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        return self.iter();
-    }
-}
-
-impl Index<String> for LFUFileCache {
-    type Output = String;
-    fn index(&self, index: String) -> &Self::Output {
-        return self.cache.get(&Rc::new(index)).map(|x| &x.value).unwrap();
+        state.serialize_field("cache", &self.cache)?;
+        state.serialize_field("frequency_bin", &serializable_freq_bin)?;
+        state.serialize_field("capacity", &self.capacity)?;
+        state.serialize_field("min_frequency", &self.min_frequency)?;
+        state.serialize_field("cache_dir", &self.cache_dir)?;
+        state.end()
     }
 }

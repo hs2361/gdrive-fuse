@@ -10,8 +10,9 @@ use std::cmp::min;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::unix::fs::FileExt;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
-use std::vec;
+use std::{thread, vec};
 
 mod filetree;
 mod lfu_cache;
@@ -26,7 +27,7 @@ const CACHE_CAPACITY: usize = 5;
 struct DriveFS {
     drive_client: Drive,
     file_tree: FileTree,
-    file_cache: LFUFileCache,
+    file_cache: Arc<Mutex<LFUFileCache>>,
 }
 
 fn get_all_files(drive_client: &Drive) -> Vec<File> {
@@ -172,12 +173,23 @@ impl DriveFS {
         DriveFS {
             drive_client,
             file_tree,
-            file_cache: LFUFileCache::with_capacity(
-                "/home/harsh/.drivefs/".to_string(),
-                CACHE_CAPACITY,
-            )
-            .unwrap(),
+            file_cache: Arc::new(Mutex::new(
+                LFUFileCache::with_capacity(
+                    "/home/harsh/.drivefs/cache/".to_string(),
+                    CACHE_CAPACITY,
+                )
+                .unwrap(),
+            )),
         }
+    }
+
+    fn save_cache_state(&self) {
+        let file_cache_arc = Arc::clone(&self.file_cache);
+        thread::spawn(move || loop {
+            println!("Saving cache state");
+            file_cache_arc.lock().unwrap().save_state();
+            thread::sleep(Duration::from_secs(60));
+        });
     }
 }
 
@@ -275,7 +287,9 @@ impl Filesystem for DriveFS {
             ino, offset, size
         );
         if let Some(node) = self.file_tree.get_node_at((ino - 1) as usize) {
-            if let Some(cached_file) = self.file_cache.get(&node.id, true) {
+            let file_cache_arc = Arc::clone(&self.file_cache);
+            let mut file_cache = file_cache_arc.lock().unwrap();
+            if let Some(cached_file) = file_cache.get(&node.id, true) {
                 println!("Cache hit for ID {}", node.id);
                 let file_size = cached_file.metadata().unwrap().len();
                 let offset = offset as u64;
@@ -289,7 +303,7 @@ impl Filesystem for DriveFS {
                 let result = self.drive_client.files.get_media(node.id.clone()).execute();
                 match result {
                     Ok(file_bytes) => {
-                        self.file_cache.set(node.id.clone(), file_bytes.clone());
+                        file_cache.set(node.id.clone(), file_bytes.clone());
                         println!("Inserted cache entry for {}", node.id);
                         let start = offset as usize;
                         let end = min(start + 1 + size as usize, file_bytes.len());
@@ -401,5 +415,8 @@ fn main() {
     if matches.get_flag("allow-root") {
         options.push(MountOption::AllowRoot);
     }
-    fuser::mount2(DriveFS::new(drive), mountpoint, &options).unwrap();
+
+    let fs = DriveFS::new(drive);
+    fs.save_cache_state();
+    fuser::mount2(fs, mountpoint, &options).unwrap();
 }

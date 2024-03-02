@@ -30,23 +30,23 @@ impl FileMetadata {
 }
 
 impl From<&File> for FileMetadata {
-    fn from(value: &File) -> Self {
+    fn from(file: &File) -> Self {
         FileMetadata {
-            name: value.name.clone().unwrap_or_default(),
-            size: value
+            name: file.name.clone().unwrap_or_default(),
+            size: file
                 .size
                 .clone()
                 .unwrap_or(String::from("0"))
                 .parse::<u64>()
                 .unwrap_or_default(),
             creation_time: rfc3339_to_system_time(
-                value.created_time.clone().unwrap_or_default().as_str(),
+                file.created_time.clone().unwrap_or_default().as_str(),
             ),
             access_time: rfc3339_to_system_time(
-                value.viewed_by_me_time.clone().unwrap_or_default().as_str(),
+                file.viewed_by_me_time.clone().unwrap_or_default().as_str(),
             ),
             last_modified_time: rfc3339_to_system_time(
-                value.modified_time.clone().unwrap_or_default().as_str(),
+                file.modified_time.clone().unwrap_or_default().as_str(),
             ),
         }
     }
