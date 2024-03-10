@@ -15,6 +15,7 @@ pub struct FileMetadata {
     pub creation_time: SystemTime,
     pub access_time: SystemTime,
     pub last_modified_time: SystemTime,
+    pub mime_type: String,
 }
 
 impl FileMetadata {
@@ -25,6 +26,7 @@ impl FileMetadata {
             creation_time: UNIX_EPOCH,
             access_time: UNIX_EPOCH,
             last_modified_time: UNIX_EPOCH,
+            mime_type: "text/plain".to_string(),
         }
     }
 }
@@ -32,7 +34,7 @@ impl FileMetadata {
 impl From<&File> for FileMetadata {
     fn from(file: &File) -> Self {
         FileMetadata {
-            name: file.name.clone().unwrap_or_default(),
+            name: file.name.clone().unwrap_or_default().replace("/", "⁄"),
             size: file
                 .size
                 .clone()
@@ -48,6 +50,7 @@ impl From<&File> for FileMetadata {
             last_modified_time: rfc3339_to_system_time(
                 file.modified_time.clone().unwrap_or_default().as_str(),
             ),
+            mime_type: file.mime_type.clone().unwrap_or_default(),
         }
     }
 }
@@ -170,7 +173,7 @@ pub struct FileTreeWalker {
 }
 
 impl FileTreeWalker {
-    fn new(tree_root: Option<usize>) -> Self {
+    pub fn new(tree_root: Option<usize>) -> Self {
         match tree_root {
             Some(root) => FileTreeWalker {
                 unvisited_node_indices: vec![root],

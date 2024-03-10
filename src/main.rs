@@ -1,28 +1,43 @@
 use clap::{crate_version, Arg, ArgAction, Command};
 use drive_v3::objects::File;
-use drive_v3::{Credentials, Drive};
+use drive_v3::{Credentials, Drive, Error};
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
     Request,
 };
-use libc::{ENAVAIL, ENOENT};
+use libc::{ENAVAIL, ENOENT, ENOTSUP};
 use std::cmp::min;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::fs::FileExt;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 use std::{thread, vec};
 
 mod filetree;
 mod lfu_cache;
-use filetree::{FileMetadata, FileNode, FileTree};
+use filetree::{FileMetadata, FileNode, FileTree, FileTreeWalker};
 use lfu_cache::LFUFileCache;
 
-const TTL: Duration = Duration::from_secs(60); // 1 second
+const TTL: Duration = Duration::from_secs(60); // 1 minute
 const DEFAULT_PARENT: &str = "My Drive";
+const DEFAULT_PERMS: u16 = 0o550; // r-xr-x---
 const MAX_PAGE_SIZE: i64 = 1000;
 const CACHE_CAPACITY: usize = 5;
+const GOOGLE_WORKSPACE_MIME_PREFIX: &str = "application/vnd.google-apps.";
+
+fn get_app_mime_type(app_name: &str) -> &'static str {
+    match app_name {
+        "document" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "spreadsheet" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "presentation" => {
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        }
+        "drawing" => "image/svg+xml",
+        "script+json" => "application/vnd.google-apps.script+json",
+        &_ => "application/pdf",
+    }
+}
 
 struct DriveFS {
     drive_client: Drive,
@@ -30,20 +45,24 @@ struct DriveFS {
     file_cache: Arc<Mutex<LFUFileCache>>,
 }
 
-fn get_all_files(drive_client: &Drive) -> Vec<File> {
+fn get_all_files(drive_client: &Drive, query: String) -> Vec<File> {
     let mut next_page_token = Some(String::new());
     let mut file_list: Vec<File> = vec![];
 
+    let client = drive_client
+    .files
+    .list()
+    .include_items_from_all_drives(false)
+    .page_size(MAX_PAGE_SIZE)
+    .fields(
+        "nextPageToken,files(name, parents, id, size, viewedByMeTime, createdTime, modifiedTime, ownedByMe, mimeType)",
+    ) // Set what fields will be returned
+    .q(query);
+
     while next_page_token.is_some() {
-        let response = drive_client
-            .files
-            .list()
-            .include_items_from_all_drives(false)
+        let response = client
+            .clone()
             .page_token(next_page_token.unwrap())
-            .page_size(MAX_PAGE_SIZE)
-            .fields(
-                "nextPageToken,files(name, parents, id, size, viewedByMeTime, createdTime, modifiedTime, trashed, owned_by_me)",
-            ) // Set what fields will be returned
             // .q("name = 'Test Folder' or name = 'Test Subfolder' or name = 'main.rs'")
             .execute()
             .unwrap();
@@ -56,119 +75,102 @@ fn get_all_files(drive_client: &Drive) -> Vec<File> {
 
 impl DriveFS {
     fn new(drive_client: Drive) -> DriveFS {
-        let files = get_all_files(&drive_client);
-        let mut parent_ids = HashSet::<String>::new();
-        let mut parent_metadata_map = HashMap::<String, FileMetadata>::new();
-        let mut id_name_map = HashMap::<String, String>::new();
+        let mut query =
+            String::from("mimeType = 'application/vnd.google-apps.folder' and not trashed");
+        let folders = get_all_files(&drive_client, query);
 
-        for file in &files {
-            id_name_map.insert(file.id.clone().unwrap(), file.name.clone().unwrap());
-            let file_parents = file.parents.clone().unwrap_or_default();
-            assert!(file_parents.len() <= 1, "File has more than 1 parent");
-            parent_ids.extend(file_parents);
-        }
-
-        // Hack to avoid implementing topological sort
-        // ideally we should be traversing the nodes in topologically sorted order
-        // so that parent directories get created first
-        for file in &files {
-            let file_id = &file.id.clone().unwrap();
-            if parent_ids.contains(file_id) {
-                parent_metadata_map.insert(file_id.to_string(), FileMetadata::from(file));
-            }
-        }
-
-        let mut root_id = String::new();
-        for parent in &parent_ids {
-            if !id_name_map.contains_key(parent) {
-                root_id = parent.clone();
-                parent_ids.insert(root_id.clone());
-                break;
-            }
-        }
-
-        let root_metadata = FileMetadata {
-            name: DEFAULT_PARENT.to_string(),
-            size: 0,
-            creation_time: UNIX_EPOCH,
-            access_time: UNIX_EPOCH,
-            last_modified_time: UNIX_EPOCH,
-        };
-        let root_node = FileNode::new(root_id, root_metadata);
+        let root_metadata = FileMetadata::default(DEFAULT_PARENT.to_string());
+        let root_node = FileNode::new(String::new(), root_metadata);
         let mut file_tree = FileTree::new(0);
         file_tree.add_node(root_node, false);
-        // println!("{}", &files.len());
+
+        let folder_metadata_map: HashMap<String, FileMetadata> = folders
+            .iter()
+            .map(|folder| (folder.id.clone().unwrap(), FileMetadata::from(folder)))
+            .collect();
+
+        // FIX: Some files don't have a parent?
+        for folder in &folders {
+            let folder_id = folder.id.clone().unwrap();
+            let parent = folder.parents.clone().unwrap_or(vec![String::new()])[0].clone();
+
+            let parent_index;
+            let node_index;
+
+            if let Some(index) = file_tree.find_node_index(&parent) {
+                parent_index = index;
+            } else {
+                let parent_metadata;
+                if let Some(meta) = folder_metadata_map.get(&parent) {
+                    parent_metadata = meta.clone()
+                } else {
+                    println!("Metadata not found for parent with ID {}", &parent);
+                    parent_metadata = FileMetadata::default(DEFAULT_PARENT.to_string());
+                }
+                let parent_node = FileNode::new(parent, parent_metadata);
+                parent_index = file_tree.add_node(parent_node, false);
+            }
+
+            if let Some(index) = file_tree.find_node_index(&folder_id) {
+                node_index = index;
+            } else {
+                let folder_metadata = FileMetadata::from(folder);
+                let folder_node = FileNode::new(folder_id, folder_metadata);
+                node_index = file_tree.add_node(folder_node, false);
+            }
+
+            file_tree
+                .get_node_at_mut(parent_index)
+                .unwrap()
+                .add_child(node_index);
+        }
+
+        query = String::from("mimeType != 'application/vnd.google-apps.folder' and not trashed");
+        let files = get_all_files(&drive_client, query);
 
         for file in &files {
-            for parent in &file
-                .parents
-                .clone()
-                .unwrap_or(vec![DEFAULT_PARENT.to_string()])
-            {
-                let file_id = &file.id.clone().unwrap();
-                let file_name = &file.name.clone().unwrap();
+            let file_id = file.id.clone().unwrap();
+            let parent = file.parents.clone().unwrap_or(vec![String::new()])[0].clone();
+            let node_index;
 
-                let mut this_node_exists = false;
-                let mut this_node_index: usize = 0;
-                if let Some(idx) = &file_tree.find_node_index(&file_id) {
-                    this_node_index = *idx;
-                    this_node_exists = true;
-                }
+            let parent_index = file_tree.find_node_index(&parent).unwrap_or(0);
 
-                if parent_ids.contains(parent) {
-                    if !this_node_exists {
-                        let metadata = FileMetadata::from(file);
-                        let node = FileNode::new(file_id.clone(), metadata);
-                        this_node_index = file_tree.add_node(node, false);
-                    }
-                    if let Some(parent_node) = file_tree.find_node_mut(parent) {
-                        // println!(
-                        //     "Appending child node with name: {} to existing parent with name: {}",
-                        //     file_name,
-                        //     id_name_map
-                        //         .get(parent)
-                        //         .unwrap_or(&DEFAULT_PARENT.to_string())
-                        // );
-                        parent_node.add_child(this_node_index);
-                    } else {
-                        // println!(
-                        //     "Could not find existing parent with ID: {} and name: {}",
-                        //     parent.clone(),
-                        //     id_name_map
-                        //         .get(parent)
-                        //         .unwrap_or(&DEFAULT_PARENT.to_string())
-                        // );
-                        // println!(
-                        //     "Creating new parent node with name: {} and child node: {}",
-                        //     id_name_map
-                        //         .get(parent)
-                        //         .unwrap_or(&DEFAULT_PARENT.to_string()),
-                        //     file_name,
-                        // );
-                        let parent_name = id_name_map
-                            .get(parent)
-                            .unwrap_or(&DEFAULT_PARENT.to_string())
-                            .clone();
-                        let parent_metadata = parent_metadata_map
-                            .get(parent)
-                            .unwrap_or(&FileMetadata::default(parent_name))
-                            .clone();
-                        let mut parent_node = FileNode::new(parent.clone(), parent_metadata);
-                        parent_node.add_child(this_node_index);
-                        file_tree.add_node(parent_node, false);
-                    }
-                } else if !this_node_exists {
-                    let metadata = FileMetadata::from(file);
-                    let node = FileNode::new(file_id.clone(), metadata);
-                    file_tree.add_node(node, true);
-                    // println!(
-                    //     "Added leaf node with ID: {} and name: {}",
-                    //     file_id, file_name
-                    // );
-                }
+            if let Some(index) = file_tree.find_node_index(&file_id) {
+                println!(
+                    "Node {} with name {} already exists. This shouldn't happen",
+                    &file_id,
+                    file.name.clone().unwrap()
+                );
+                node_index = index;
+            } else {
+                let metadata = FileMetadata::from(file);
+                let folder_node = FileNode::new(file_id, metadata);
+                node_index = file_tree.add_node(folder_node, false);
             }
+            file_tree
+                .get_node_at_mut(parent_index)
+                .unwrap()
+                .add_child(node_index);
         }
-        println!("Found {} files and folders", file_tree.len());
+
+        println!("Found {} files and folders.", file_tree.len());
+
+        let root = file_tree.get_node_at(0).unwrap();
+        println!(
+            "Root (ID {}, name {}) has {} child nodes",
+            root.id,
+            root.metadata.name,
+            root.children.len()
+        );
+
+        let mut tree_walker = FileTreeWalker::new(Some(0));
+
+        let mut file_count = 0;
+        while let Some(_) = tree_walker.next(&file_tree) {
+            file_count += 1;
+        }
+
+        println!("Walking file tree found {} files", file_count);
 
         DriveFS {
             drive_client,
@@ -183,7 +185,7 @@ impl DriveFS {
         }
     }
 
-    fn save_cache_state(&self) {
+    fn start_bg_cache_state_worker(&self) {
         let file_cache_arc = Arc::clone(&self.file_cache);
         thread::spawn(move || loop {
             println!("Saving cache state");
@@ -209,11 +211,11 @@ impl Filesystem for DriveFS {
                     if child_node.children.len() > 0 {
                         file_type = FileType::Directory;
                     }
-                    println!(
-                        "Inode {} - Name {}",
-                        &(child_index + 1),
-                        &child_node.metadata.name
-                    );
+                    // println!(
+                    //     "Inode {} - Name {}",
+                    //     &(child_index + 1),
+                    //     &child_node.metadata.name
+                    // );
                     let node_attr = FileAttr {
                         ino: (child_index + 1) as u64,
                         size: child_node.metadata.size,
@@ -223,7 +225,7 @@ impl Filesystem for DriveFS {
                         ctime: child_node.metadata.last_modified_time,
                         crtime: child_node.metadata.creation_time,
                         kind: file_type,
-                        perm: 0o644,
+                        perm: DEFAULT_PERMS,
                         nlink: 0,
                         uid: 1000,
                         gid: 1000,
@@ -241,7 +243,7 @@ impl Filesystem for DriveFS {
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        println!("getattr for {} ino", ino);
+        // println!("getattr for {} ino", ino);
         if let Some(node) = self.file_tree.get_node_at((ino - 1) as usize) {
             let mut file_type = FileType::RegularFile;
             if node.children.len() > 0 {
@@ -256,7 +258,7 @@ impl Filesystem for DriveFS {
                 ctime: node.metadata.last_modified_time,
                 crtime: node.metadata.creation_time,
                 kind: file_type,
-                perm: 0o644,
+                perm: DEFAULT_PERMS,
                 nlink: 0,
                 uid: 1000,
                 gid: 1000,
@@ -300,8 +302,36 @@ impl Filesystem for DriveFS {
                 return;
             } else {
                 println!("Cache miss for ID {}", node.id);
-                let result = self.drive_client.files.get_media(node.id.clone()).execute();
-                match result {
+                let download_result: Result<Vec<u8>, Error>;
+                if node
+                    .metadata
+                    .mime_type
+                    .starts_with(GOOGLE_WORKSPACE_MIME_PREFIX)
+                {
+                    let app_name = node
+                        .metadata
+                        .mime_type
+                        .split(GOOGLE_WORKSPACE_MIME_PREFIX)
+                        .collect::<Vec<&str>>()[1];
+
+                    let unsupported_apps = ["folder", "drive-sdk", "shortcut"];
+                    if unsupported_apps.contains(&app_name) {
+                        reply.error(ENOTSUP);
+                        return;
+                    } else {
+                        let mime_type = get_app_mime_type(app_name);
+                        download_result = self
+                            .drive_client
+                            .files
+                            .export(&node.id)
+                            .mime_type(mime_type)
+                            .execute();
+                    }
+                } else {
+                    download_result = self.drive_client.files.get_media(&node.id).execute();
+                }
+
+                match download_result {
                     Ok(file_bytes) => {
                         file_cache.set(node.id.clone(), file_bytes.clone());
                         println!("Inserted cache entry for {}", node.id);
@@ -330,13 +360,13 @@ impl Filesystem for DriveFS {
         mut reply: ReplyDirectory,
     ) {
         println!("readdir for {} ino with offset {}", ino, offset);
-        let mut entries: Vec<(u64, FileType, String)> = vec![
-            (1, FileType::Directory, String::from(".")),
-            (1, FileType::Directory, String::from("..")),
-        ];
+        assert!(offset >= 0, "readdir called with negative offset");
+
+        let mut entries: Vec<(u64, FileType, String)> = Vec::new();
+        let offset = offset as usize;
 
         if let Some(node) = self.file_tree.get_node_at((ino - 1) as usize) {
-            for child_index in &node.children {
+            for child_index in node.children.iter() {
                 if let Some(child_node) = self.file_tree.get_node_at(*child_index) {
                     let mut file_type = FileType::RegularFile;
                     if child_node.children.len() > 0 {
@@ -347,17 +377,41 @@ impl Filesystem for DriveFS {
                         file_type,
                         child_node.metadata.name.clone(),
                     ))
+                } else {
+                    println!("Could not find child at tree index: {}", child_index);
                 }
             }
+        } else {
+            println!("Returning ENOENT for readdir");
+            return reply.error(ENOENT);
         }
 
-        for entry in entries.into_iter().skip(offset as usize) {
-            // i + 1 means the index of the next entry
-            println!("Inode {} - Name {}", &entry.0, &entry.2);
-            if reply.add(entry.0, (entry.0 + 1) as i64, entry.1, entry.2) {
+        let num_entries = entries.len();
+        println!("Total {} entries", num_entries);
+        let mut count = 0;
+        for (index, entry) in entries.iter().skip(offset).enumerate() {
+            // println!(
+            //     "Inode {} - Type {:?} - Offset {} - Name {}",
+            //     &entry.0,
+            //     &entry.1,
+            //     (offset + index + 1),
+            //     &entry.2
+            // );
+
+            count += 1;
+            let buf_full = reply.add(
+                entry.0,
+                (offset + index + 1) as i64,
+                entry.1,
+                entry.2.clone(),
+            );
+            if buf_full {
+                println!("Buffer full after returning {} entries", count,);
+                println!("Last inode {}, offset {}", entry.0, (index + 1));
                 break;
             }
         }
+
         reply.ok();
     }
 }
@@ -417,6 +471,6 @@ fn main() {
     }
 
     let fs = DriveFS::new(drive);
-    fs.save_cache_state();
+    fs.start_bg_cache_state_worker();
     fuser::mount2(fs, mountpoint, &options).unwrap();
 }
