@@ -1,5 +1,9 @@
-// Arena allocator based k-ary file tree implementation generalized from https://sachanganesh.com/programming/graph-tree-traversals-in-rust/
-use std::time::{SystemTime, UNIX_EPOCH};
+// Arena allocator based k-ary file tree implementation
+// generalized from https://sachanganesh.com/programming/graph-tree-traversals-in-rust/
+use std::{
+    collections::{HashMap, VecDeque},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use chrono::DateTime;
 use drive_v3::objects::File;
@@ -129,39 +133,39 @@ impl FileTree {
         None
     }
 
-    pub fn find_node(&self, id: &String) -> Option<&FileNode> {
-        for node in &self.arena {
-            if node.is_some() && node.as_ref().unwrap().id == *id {
-                return node.as_ref();
-            }
-        }
-        None
-    }
+    // pub fn find_node(&self, id: &String) -> Option<&FileNode> {
+    //     for node in &self.arena {
+    //         if node.is_some() && node.as_ref().unwrap().id == *id {
+    //             return node.as_ref();
+    //         }
+    //     }
+    //     None
+    // }
 
-    pub fn find_node_mut(&mut self, id: &String) -> Option<&mut FileNode> {
-        for node in &mut self.arena {
-            if node.is_some() && node.as_ref().unwrap().id == *id {
-                return node.as_mut();
-            }
-        }
-        None
-    }
+    // pub fn find_node_mut(&mut self, id: &String) -> Option<&mut FileNode> {
+    //     for node in &mut self.arena {
+    //         if node.is_some() && node.as_ref().unwrap().id == *id {
+    //             return node.as_mut();
+    //         }
+    //     }
+    //     None
+    // }
 
-    pub fn delete_node_at(&mut self, index: usize) -> Option<FileNode> {
-        match self.arena.get_mut(index) {
-            Some(node) => node.take(),
-            None => None,
-        }
-    }
+    // pub fn delete_node_at(&mut self, index: usize) -> Option<FileNode> {
+    //     match self.arena.get_mut(index) {
+    //         Some(node) => node.take(),
+    //         None => None,
+    //     }
+    // }
 
-    pub fn iter(&self, node_index: Option<usize>) -> FileTreeWalker {
-        println!("{:?}", self.arena);
-        if let Some(index) = node_index {
-            FileTreeWalker::new(Some(index))
-        } else {
-            FileTreeWalker::new(Some(self.root_node_index.clone()))
-        }
-    }
+    // pub fn iter(&self, node_index: Option<usize>) -> FileTreeWalker {
+    //     println!("{:?}", self.arena);
+    //     if let Some(index) = node_index {
+    //         FileTreeWalker::new(Some(index))
+    //     } else {
+    //         FileTreeWalker::new(Some(self.root_node_index.clone()))
+    //     }
+    // }
 
     pub fn len(&self) -> usize {
         self.arena.len()
@@ -193,4 +197,56 @@ impl FileTreeWalker {
         }
         None
     }
+}
+
+// Kahn's algorithm for topologically sorting a DAG
+// https://www.geeksforgeeks.org/topological-sorting-indegree-based-solution/
+pub fn topological_sort(
+    id_parent_map: &HashMap<String, String>,
+) -> Result<Vec<String>, &'static str> {
+    let mut in_degree_map: HashMap<String, usize> = HashMap::new();
+
+    // compute in-degrees of all vertices
+    for parent in id_parent_map.values() {
+        *in_degree_map.entry(parent.clone()).or_default() += 1;
+    }
+
+    // find all vertices that have no incoming edges
+    let mut zero_degree_vertices: VecDeque<String> = VecDeque::new();
+    for id in id_parent_map.keys() {
+        if *in_degree_map.entry(id.clone()).or_default() == 0 {
+            zero_degree_vertices.push_back(id.clone());
+        }
+    }
+
+    // initialize result vector
+    let mut topo_sorted: Vec<String> = Vec::with_capacity(id_parent_map.len());
+
+    // keep popping vertices from the zero in-degree queue until empty
+    while !zero_degree_vertices.is_empty() {
+        let node = zero_degree_vertices.pop_front().unwrap();
+
+        // This vertex is in topologically sorted order so add it to the result vector
+        topo_sorted.push(node.clone());
+
+        // We've popped the vertex off, so decrement the in-degree of its parent vertices
+        if let Some(parent) = id_parent_map.get(&node) {
+            if let Some(degree) = in_degree_map.get_mut(parent) {
+                *degree -= 1;
+
+                // If the parent vertex has no incoming edges, push it into the queue
+                if *degree == 0 {
+                    zero_degree_vertices.push_back(parent.clone());
+                }
+            }
+        }
+    }
+
+    // The result vector should have all the vertices
+    if topo_sorted.len() < id_parent_map.len() {
+        return Err("Cycle detected in graph, not a DAG");
+    }
+
+    // Return the result vector
+    Ok(topo_sorted)
 }

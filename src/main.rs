@@ -1,34 +1,41 @@
 use clap::{crate_version, Arg, ArgAction, Command};
 use drive_v3::objects::File;
-use drive_v3::{Credentials, Drive, Error};
+use drive_v3::{Credentials, Drive};
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
     Request,
 };
-use libc::{ENAVAIL, ENOENT, ENOTSUP};
+use libc::{ENOENT, ENOTSUP};
 use std::cmp::min;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::fs::FileExt;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 use std::{thread, vec};
 
-mod filetree;
+mod file_downloader;
+mod file_tree;
 mod lfu_cache;
-use filetree::{FileMetadata, FileNode, FileTree, FileTreeWalker};
+use file_downloader::{DownloadMessage, FileDownloader};
+use file_tree::{topological_sort, FileMetadata, FileNode, FileTree, FileTreeWalker};
 use lfu_cache::LFUFileCache;
 
 const TTL: Duration = Duration::from_secs(60); // 1 minute
 const DEFAULT_PARENT: &str = "My Drive";
 const DEFAULT_PERMS: u16 = 0o550; // r-xr-x---
 const MAX_PAGE_SIZE: i64 = 1000;
-const CACHE_CAPACITY: usize = 5;
+const CACHE_CAPACITY: usize = 100;
 const GOOGLE_WORKSPACE_MIME_PREFIX: &str = "application/vnd.google-apps.";
+const FOLDER_MIME_TYPE: &str = "application/vnd.google-apps.folder";
 
+// https://developers.google.com/drive/api/guides/mime-types
+// https://developers.google.com/drive/api/guides/ref-export-formats
 fn get_app_mime_type(app_name: &str) -> &'static str {
     match app_name {
-        "document" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        // "document" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "document" => "application/pdf",
         "spreadsheet" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "presentation" => {
             "application/vnd.openxmlformats-officedocument.presentationml.presentation"
@@ -40,9 +47,13 @@ fn get_app_mime_type(app_name: &str) -> &'static str {
 }
 
 struct DriveFS {
-    drive_client: Drive,
+    credentials: Credentials,
+    google_workspace_file_size_map: HashMap<String, u64>,
     file_tree: FileTree,
     file_cache: Arc<Mutex<LFUFileCache>>,
+    file_downloader: FileDownloader,
+    request_channel: Sender<DownloadMessage>,
+    file_bytes_channel: Receiver<Vec<u8>>,
 }
 
 fn get_all_files(drive_client: &Drive, query: String) -> Vec<File> {
@@ -57,6 +68,7 @@ fn get_all_files(drive_client: &Drive, query: String) -> Vec<File> {
     .fields(
         "nextPageToken,files(name, parents, id, size, viewedByMeTime, createdTime, modifiedTime, ownedByMe, mimeType)",
     ) // Set what fields will be returned
+    //TODO: exportLinks
     .q(query);
 
     while next_page_token.is_some() {
@@ -74,83 +86,71 @@ fn get_all_files(drive_client: &Drive, query: String) -> Vec<File> {
 }
 
 impl DriveFS {
-    fn new(drive_client: Drive) -> DriveFS {
-        let mut query =
-            String::from("mimeType = 'application/vnd.google-apps.folder' and not trashed");
-        let folders = get_all_files(&drive_client, query);
+    fn new(credentials: Credentials) -> DriveFS {
+        let drive_client = Drive::new(&credentials);
+        let query = String::from("not trashed");
+        let files = get_all_files(&drive_client, query);
 
-        let root_metadata = FileMetadata::default(DEFAULT_PARENT.to_string());
+        let root_metadata = FileMetadata {
+            name: DEFAULT_PARENT.to_string(),
+            size: 0,
+            creation_time: UNIX_EPOCH,
+            access_time: UNIX_EPOCH,
+            last_modified_time: UNIX_EPOCH,
+            mime_type: FOLDER_MIME_TYPE.to_string(),
+        };
         let root_node = FileNode::new(String::new(), root_metadata);
         let mut file_tree = FileTree::new(0);
         file_tree.add_node(root_node, false);
 
-        let folder_metadata_map: HashMap<String, FileMetadata> = folders
-            .iter()
-            .map(|folder| (folder.id.clone().unwrap(), FileMetadata::from(folder)))
-            .collect();
+        println!("API call returned {} files & folders", files.len());
 
-        // FIX: Some files don't have a parent?
-        for folder in &folders {
-            let folder_id = folder.id.clone().unwrap();
-            let parent = folder.parents.clone().unwrap_or(vec![String::new()])[0].clone();
+        let mut id_parent_map: HashMap<String, String> = HashMap::with_capacity(files.len());
+        let mut file_metadata_map: HashMap<String, FileMetadata> =
+            HashMap::with_capacity(files.len());
 
-            let parent_index;
-            let node_index;
+        for file in files {
+            id_parent_map.insert(
+                file.id.clone().unwrap(),
+                file.parents.clone().unwrap_or(vec![String::new()])[0].clone(),
+            );
 
-            if let Some(index) = file_tree.find_node_index(&parent) {
-                parent_index = index;
-            } else {
-                let parent_metadata;
-                if let Some(meta) = folder_metadata_map.get(&parent) {
-                    parent_metadata = meta.clone()
-                } else {
-                    println!("Metadata not found for parent with ID {}", &parent);
-                    parent_metadata = FileMetadata::default(DEFAULT_PARENT.to_string());
-                }
-                let parent_node = FileNode::new(parent, parent_metadata);
-                parent_index = file_tree.add_node(parent_node, false);
-            }
-
-            if let Some(index) = file_tree.find_node_index(&folder_id) {
-                node_index = index;
-            } else {
-                let folder_metadata = FileMetadata::from(folder);
-                let folder_node = FileNode::new(folder_id, folder_metadata);
-                node_index = file_tree.add_node(folder_node, false);
-            }
-
-            file_tree
-                .get_node_at_mut(parent_index)
-                .unwrap()
-                .add_child(node_index);
+            file_metadata_map.insert(file.id.clone().unwrap(), FileMetadata::from(&file));
         }
 
-        query = String::from("mimeType != 'application/vnd.google-apps.folder' and not trashed");
-        let files = get_all_files(&drive_client, query);
+        for file_id in topological_sort(&id_parent_map).unwrap().iter().rev() {
+            if let Some(parent) = id_parent_map.get(file_id) {
+                let parent_index;
+                let node_index;
 
-        for file in &files {
-            let file_id = file.id.clone().unwrap();
-            let parent = file.parents.clone().unwrap_or(vec![String::new()])[0].clone();
-            let node_index;
+                if let Some(index) = file_tree.find_node_index(&parent) {
+                    parent_index = index;
+                } else {
+                    println!("Parent node not found with ID {}!", &parent);
+                    parent_index = 0;
+                }
 
-            let parent_index = file_tree.find_node_index(&parent).unwrap_or(0);
+                if let Some(index) = file_tree.find_node_index(&file_id) {
+                    node_index = index;
+                } else {
+                    let file_metadata;
+                    if let Some(meta) = file_metadata_map.get(file_id) {
+                        file_metadata = meta.clone()
+                    } else {
+                        println!("Metadata not found for file with ID {}", &parent);
+                        file_metadata = FileMetadata::default(DEFAULT_PARENT.to_string());
+                    }
+                    let folder_node = FileNode::new(file_id.clone(), file_metadata);
+                    node_index = file_tree.add_node(folder_node, false);
+                }
 
-            if let Some(index) = file_tree.find_node_index(&file_id) {
-                println!(
-                    "Node {} with name {} already exists. This shouldn't happen",
-                    &file_id,
-                    file.name.clone().unwrap()
-                );
-                node_index = index;
+                file_tree
+                    .get_node_at_mut(parent_index)
+                    .unwrap()
+                    .add_child(node_index);
             } else {
-                let metadata = FileMetadata::from(file);
-                let folder_node = FileNode::new(file_id, metadata);
-                node_index = file_tree.add_node(folder_node, false);
+                println!("Skipping creating root level folder: {}", file_id);
             }
-            file_tree
-                .get_node_at_mut(parent_index)
-                .unwrap()
-                .add_child(node_index);
         }
 
         println!("Found {} files and folders.", file_tree.len());
@@ -169,19 +169,37 @@ impl DriveFS {
         while let Some(_) = tree_walker.next(&file_tree) {
             file_count += 1;
         }
-
         println!("Walking file tree found {} files", file_count);
 
-        DriveFS {
-            drive_client,
-            file_tree,
-            file_cache: Arc::new(Mutex::new(
-                LFUFileCache::with_capacity(
-                    "/home/harsh/.drivefs/cache/".to_string(),
-                    CACHE_CAPACITY,
-                )
+        let (req_tx, req_rx) = mpsc::channel();
+        let (file_bytes_tx, file_bytes_rx) = mpsc::channel();
+
+        let file_cache = Arc::new(Mutex::new(
+            LFUFileCache::with_capacity("/home/harsh/.drivefs/cache/".to_string(), CACHE_CAPACITY)
                 .unwrap(),
-            )),
+        ));
+
+        let file_cache_clone = Arc::clone(&file_cache);
+        let logical_cores = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+
+        let file_downloader = FileDownloader::new(
+            logical_cores * 2,
+            &credentials,
+            req_rx,
+            file_bytes_tx,
+            file_cache_clone,
+        );
+
+        DriveFS {
+            credentials,
+            google_workspace_file_size_map: HashMap::new(),
+            file_tree,
+            file_cache,
+            file_downloader,
+            request_channel: req_tx,
+            file_bytes_channel: file_bytes_rx,
         }
     }
 
@@ -193,6 +211,40 @@ impl DriveFS {
             thread::sleep(Duration::from_secs(60));
         });
     }
+
+    fn start_file_downloader_threads(&self) {
+        self.file_downloader.start_workers();
+    }
+}
+
+fn get_file_size(credentials: &Credentials, file_id: &String, mime_type: &String) -> Option<u64> {
+    let base_url = format!(
+        "https://www.googleapis.com/drive/v3/files/{}/export",
+        file_id
+    );
+
+    let url =
+        reqwest::Url::parse_with_params(base_url.as_str(), &[("mimeType", mime_type.as_str())])
+            .unwrap();
+
+    let res = reqwest::blocking::Client::new()
+        .request(reqwest::Method::HEAD, url)
+        .bearer_auth(credentials.get_access_token())
+        .send()
+        .unwrap();
+
+    if !res.status().is_success() {
+        return None;
+    }
+
+    res.headers()
+        .get("Content-Length")
+        .ok_or("No content length header set")
+        .ok()?
+        .to_str()
+        .ok()?
+        .parse::<u64>()
+        .ok()
 }
 
 impl Filesystem for DriveFS {
@@ -208,17 +260,42 @@ impl Filesystem for DriveFS {
                 let child_node = self.file_tree.get_node_at(child_index).unwrap();
                 if child_node.metadata.name == name.to_str().unwrap() {
                     let mut file_type = FileType::RegularFile;
-                    if child_node.children.len() > 0 {
+                    let mime_type = child_node.metadata.mime_type.clone();
+                    let mut file_size = child_node.metadata.size;
+
+                    if mime_type.starts_with(GOOGLE_WORKSPACE_MIME_PREFIX) {
+                        if mime_type == FOLDER_MIME_TYPE {
+                            file_type = FileType::Directory;
+                        } else {
+                            let file_id = child_node.id.clone();
+
+                            if let Some(size) = self.google_workspace_file_size_map.get(&file_id) {
+                                file_size = *size;
+                            } else {
+                                let app_name = mime_type
+                                    .split(GOOGLE_WORKSPACE_MIME_PREFIX)
+                                    .collect::<Vec<&str>>()[1];
+                                let export_mime_type = get_app_mime_type(app_name).to_string();
+                                let exported_file_size =
+                                    get_file_size(&self.credentials, &file_id, &export_mime_type)
+                                        .unwrap_or(10_u64.pow(6));
+                                self.google_workspace_file_size_map
+                                    .insert(child_node.id.clone(), exported_file_size);
+                                file_size = exported_file_size;
+                            }
+                        }
+                    }
+                    if child_node.metadata.mime_type == FOLDER_MIME_TYPE {
                         file_type = FileType::Directory;
                     }
                     // println!(
-                    //     "Inode {} - Name {}",
+                    //     "Inode {} - Size {}",
                     //     &(child_index + 1),
-                    //     &child_node.metadata.name
+                    //     &child_node.metadata.size
                     // );
                     let node_attr = FileAttr {
                         ino: (child_index + 1) as u64,
-                        size: child_node.metadata.size,
+                        size: file_size,
                         blocks: 1,
                         atime: child_node.metadata.access_time, // 1970-01-01 00:00:00
                         mtime: child_node.metadata.last_modified_time,
@@ -242,16 +319,39 @@ impl Filesystem for DriveFS {
         reply.error(ENOENT)
     }
 
-    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        // println!("getattr for {} ino", ino);
+    fn getattr(&mut self, _req: &Request, ino: u64, _: Option<u64>, reply: ReplyAttr) {
+        println!("getattr for {} ino", ino);
         if let Some(node) = self.file_tree.get_node_at((ino - 1) as usize) {
             let mut file_type = FileType::RegularFile;
-            if node.children.len() > 0 {
-                file_type = FileType::Directory;
+            let mime_type = node.metadata.mime_type.clone();
+            let mut file_size = node.metadata.size;
+
+            if mime_type.starts_with(GOOGLE_WORKSPACE_MIME_PREFIX) {
+                if mime_type == FOLDER_MIME_TYPE {
+                    file_type = FileType::Directory;
+                } else {
+                    let file_id = node.id.clone();
+
+                    if let Some(size) = self.google_workspace_file_size_map.get(&file_id) {
+                        file_size = *size;
+                    } else {
+                        let app_name = mime_type
+                            .split(GOOGLE_WORKSPACE_MIME_PREFIX)
+                            .collect::<Vec<&str>>()[1];
+                        let export_mime_type = get_app_mime_type(app_name).to_string();
+                        let exported_file_size =
+                            get_file_size(&self.credentials, &file_id, &export_mime_type)
+                                .unwrap_or(10_u64.pow(6));
+                        self.google_workspace_file_size_map
+                            .insert(node.id.clone(), exported_file_size);
+                        file_size = exported_file_size;
+                    }
+                }
             }
+
             let node_attr = FileAttr {
                 ino: ino,
-                size: node.metadata.size,
+                size: file_size,
                 blocks: 1,
                 atime: node.metadata.access_time, // 1970-01-01 00:00:00
                 mtime: node.metadata.last_modified_time,
@@ -285,66 +385,64 @@ impl Filesystem for DriveFS {
         reply: ReplyData,
     ) {
         println!(
-            "read for {} ino with offset: {} and size {}",
-            ino, offset, size
+            "read for {} ino with offset: {} and size {} from thread ID {:?}, PID: {}",
+            ino,
+            offset,
+            size,
+            std::thread::current().id(),
+            std::process::id()
         );
         if let Some(node) = self.file_tree.get_node_at((ino - 1) as usize) {
             let file_cache_arc = Arc::clone(&self.file_cache);
             let mut file_cache = file_cache_arc.lock().unwrap();
-            if let Some(cached_file) = file_cache.get(&node.id, true) {
+            if let Some(cached_file) = file_cache.get(&node.id, true, offset, size) {
                 println!("Cache hit for ID {}", node.id);
                 let file_size = cached_file.metadata().unwrap().len();
+                println!("Cached file size: {}, offset: {}", file_size, offset);
                 let offset = offset as u64;
                 let buf_size = min(size as usize, (file_size - offset) as usize);
                 let mut buffer = vec![0; buf_size];
                 cached_file.read_exact_at(&mut buffer, offset).unwrap();
+                println!("returning {} bytes from cached file", buffer.len());
                 reply.data(&buffer);
                 return;
-            } else {
-                println!("Cache miss for ID {}", node.id);
-                let download_result: Result<Vec<u8>, Error>;
-                if node
-                    .metadata
-                    .mime_type
-                    .starts_with(GOOGLE_WORKSPACE_MIME_PREFIX)
-                {
-                    let app_name = node
-                        .metadata
-                        .mime_type
-                        .split(GOOGLE_WORKSPACE_MIME_PREFIX)
-                        .collect::<Vec<&str>>()[1];
+            }
 
-                    let unsupported_apps = ["folder", "drive-sdk", "shortcut"];
-                    if unsupported_apps.contains(&app_name) {
-                        reply.error(ENOTSUP);
-                        return;
-                    } else {
-                        let mime_type = get_app_mime_type(app_name);
-                        download_result = self
-                            .drive_client
-                            .files
-                            .export(&node.id)
-                            .mime_type(mime_type)
-                            .execute();
-                    }
-                } else {
-                    download_result = self.drive_client.files.get_media(&node.id).execute();
-                }
+            drop(file_cache);
 
-                match download_result {
-                    Ok(file_bytes) => {
-                        file_cache.set(node.id.clone(), file_bytes.clone());
-                        println!("Inserted cache entry for {}", node.id);
-                        let start = offset as usize;
-                        let end = min(start + 1 + size as usize, file_bytes.len());
-                        reply.data(&file_bytes[start..end]);
-                    }
-                    Err(err) => {
-                        println!("Failed to download file: {}", err.to_string());
-                        reply.error(ENAVAIL);
-                    }
+            println!("Cache miss for ID {}", node.id);
+            let mut file_size = node.metadata.size;
+            let mime_type = node.metadata.mime_type.clone();
+            if mime_type.starts_with(GOOGLE_WORKSPACE_MIME_PREFIX) {
+                let app_name = mime_type
+                    .split(GOOGLE_WORKSPACE_MIME_PREFIX)
+                    .collect::<Vec<&str>>()[1];
+
+                let unsupported_apps = ["folder", "drive-sdk", "shortcut"];
+                if unsupported_apps.contains(&app_name) {
+                    reply.error(ENOTSUP);
+                    return;
+                } else if let Some(&size) = self.google_workspace_file_size_map.get(&node.id) {
+                    file_size = size;
                 }
             }
+
+            self.request_channel
+                .send(DownloadMessage {
+                    file_id: node.id.clone(),
+                    offset,
+                    size,
+                    mime_type,
+                    file_size,
+                })
+                .unwrap();
+
+            let file_bytes = self.file_bytes_channel.recv().unwrap();
+            reply.data(&file_bytes);
+            println!(
+                "Served read request with payload of {} bytes",
+                file_bytes.len()
+            );
         } else {
             println!("Returning ENOENT for read req");
             reply.error(ENOENT);
@@ -369,7 +467,7 @@ impl Filesystem for DriveFS {
             for child_index in node.children.iter() {
                 if let Some(child_node) = self.file_tree.get_node_at(*child_index) {
                     let mut file_type = FileType::RegularFile;
-                    if child_node.children.len() > 0 {
+                    if child_node.metadata.mime_type == FOLDER_MIME_TYPE {
                         file_type = FileType::Directory;
                     }
                     entries.push((
@@ -439,9 +537,11 @@ fn main() {
                 .help("Allow root user to access filesystem"),
         )
         .get_matches();
+
     // env_logger::init();
     let mountpoint = matches.get_one::<String>("MOUNT_POINT").unwrap();
 
+    // let client_secrets_path = "src/client_secret.json";
     let stored_cred_path = "src/credentials.json";
 
     // The OAuth scopes you need
@@ -450,27 +550,29 @@ fn main() {
     // let mut credentials =
     //     Credentials::from_client_secrets_file(&client_secrets_path, &scopes).unwrap();
 
+    // credentials.store(&stored_cred_path).unwrap();
     let mut credentials = Credentials::from_file(stored_cred_path, &scopes).unwrap();
+    // println!("Access token: {}", credentials.get_access_token());
 
     // Refresh the credentials if they have expired
     if !credentials.are_valid() {
         credentials.refresh().unwrap();
+        // Save them so we don't have to refresh them every time
+        credentials.store(&stored_cred_path).unwrap();
     }
-
-    // Save them so we don't have to refresh them every time
-    credentials.store(&stored_cred_path).unwrap();
-
-    let drive = Drive::new(&credentials);
 
     let mut options = vec![MountOption::RO, MountOption::FSName("drivefs".to_string())];
     if matches.get_flag("auto-unmount") {
         options.push(MountOption::AutoUnmount);
     }
+
     if matches.get_flag("allow-root") {
         options.push(MountOption::AllowRoot);
     }
 
-    let fs = DriveFS::new(drive);
+    let fs = DriveFS::new(credentials);
+    fs.start_file_downloader_threads();
     fs.start_bg_cache_state_worker();
+
     fuser::mount2(fs, mountpoint, &options).unwrap();
 }

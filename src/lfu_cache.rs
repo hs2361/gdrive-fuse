@@ -7,7 +7,8 @@ use serde_json;
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::fs::{remove_file, write, File, OpenOptions};
+use std::fs::{remove_file, File, OpenOptions};
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -51,44 +52,29 @@ impl LFUFileCache {
         serde_json::to_writer(File::create(file_path).unwrap(), &self).unwrap();
     }
 
-    pub fn contains(&self, key: &String) -> bool {
-        return self.cache.contains_key(key);
-    }
-
     pub fn len(&self) -> usize {
         self.cache.len()
     }
 
-    pub fn remove(&mut self, key: String) -> bool {
-        let file_path = Path::new(&self.cache_dir).join(key.clone());
-        let key_rc = Arc::new(key);
-        if let Some(value_counter) = self.cache.get(&Arc::clone(&key_rc)) {
-            let count = value_counter.frequency;
-            self.frequency_bin
-                .entry(count)
-                .or_default()
-                .remove(&Arc::clone(&key_rc));
-            self.cache.remove(&key_rc);
-            remove_file(file_path).unwrap();
-        }
-        return false;
-    }
-
     /// Returns the value associated with the given key (if it still exists)
     /// Method marked as mutable because it internally updates the frequency of the accessed key
-    pub fn get(&mut self, key: &String, read_only: bool) -> Option<File> {
+    pub fn get(&mut self, key: &String, read_only: bool, start: i64, size: u32) -> Option<File> {
         let file_path = Path::new(&self.cache_dir).join(key.clone());
         let key = self.cache.get_key_value(key).map(|(r, _)| Arc::clone(r))?;
         self.update_frequency_bin(Arc::clone(&key));
         if self.cache.contains_key(&key) {
-            return Some(
-                OpenOptions::new()
-                    .read(true)
-                    .write(!read_only)
-                    .open(file_path)
-                    .unwrap(),
-            );
+            let file = OpenOptions::new()
+                .read(true)
+                .write(!read_only)
+                .open(file_path)
+                .unwrap();
+            let file_size = file.metadata().unwrap().len();
+            let chunk_end = start as u64 + size as u64;
+            if file_size >= chunk_end {
+                return Some(file);
+            }
         }
+
         None
     }
 
@@ -113,25 +99,27 @@ impl LFUFileCache {
         remove_file(file_path).unwrap();
     }
 
-    // pub fn iter(&self) -> LfuIterator {
-    //     LfuIterator {
-    //         values: self.cache.iter(),
-    //     }
-    // }
-
-    pub fn set(&mut self, key: String, data: Vec<u8>) {
+    pub fn set(&mut self, key: String, data: &Vec<u8>) {
         let key_copy = key.clone();
         let file_path = Path::new(&self.cache_dir).join(&key_copy);
+        let mut fh = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(file_path)
+            .unwrap();
+
+        fh.write_all(&data).unwrap();
+
         let key_rc = Arc::new(key);
         if self.cache.contains_key(&key_rc) {
-            write(&file_path, data).unwrap();
             self.update_frequency_bin(Arc::clone(&key_rc));
             return;
         }
+
         if self.len() >= self.capacity {
             self.evict();
         }
-        write(&file_path, data.clone()).unwrap();
+
         self.cache.insert(
             Arc::clone(&key_rc),
             CacheEntry {
@@ -139,6 +127,7 @@ impl LFUFileCache {
                 frequency: 1,
             },
         );
+
         self.min_frequency = 1;
         self.frequency_bin
             .entry(self.min_frequency)
