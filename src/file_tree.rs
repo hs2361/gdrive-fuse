@@ -84,6 +84,7 @@ impl FileNode {
 pub struct FileTree {
     arena: Vec<Option<FileNode>>,
     root_node_index: usize,
+    id_index_map: HashMap<String, usize>,
 }
 
 impl FileTree {
@@ -91,10 +92,12 @@ impl FileTree {
         FileTree {
             arena: vec![],
             root_node_index,
+            id_index_map: HashMap::new(),
         }
     }
 
     pub fn add_node(&mut self, node: FileNode, add_under_root: bool) -> Result<usize, Error> {
+        let node_id = node.id.clone();
         self.arena.push(Some(node));
         let child_node_index = self.arena.len() - 1;
         if add_under_root {
@@ -108,16 +111,13 @@ impl FileTree {
             }
         }
 
+        self.id_index_map.insert(node_id, child_node_index);
         Ok(child_node_index)
     }
 
-    pub fn find_node_index(&self, id: &String) -> Option<usize> {
-        for index in 0..self.arena.len() {
-            if let Some(node) = &self.arena[index] {
-                if node.id == *id {
-                    return Some(index);
-                }
-            }
+    pub fn find_node_index(&self, id: &str) -> Option<usize> {
+        if let Some(index) = self.id_index_map.get(id) {
+            return Some(*index);
         }
         None
     }
@@ -139,32 +139,17 @@ impl FileTree {
     pub fn len(&self) -> usize {
         self.arena.len()
     }
-}
 
-pub struct FileTreeIterator {
-    unvisited_node_indices: Vec<usize>,
-}
-
-impl FileTreeIterator {
-    pub fn new(tree_root: Option<usize>) -> Self {
-        match tree_root {
-            Some(root) => FileTreeIterator {
-                unvisited_node_indices: vec![root],
-            },
-            None => FileTreeIterator {
-                unvisited_node_indices: vec![],
-            },
-        }
-    }
-
-    pub fn next(&mut self, file_tree: &FileTree) -> Option<usize> {
-        while let Some(index) = self.unvisited_node_indices.pop() {
-            if let Some(node) = file_tree.get_node_at(index) {
-                self.unvisited_node_indices.extend(node.children.clone());
-                return Some(index);
+    pub fn num_files(&self) -> usize {
+        let mut unvisited_node_indices = vec![self.root_node_index];
+        let mut file_count = 0;
+        while let Some(index) = unvisited_node_indices.pop() {
+            if let Some(node) = self.get_node_at(index) {
+                unvisited_node_indices.extend(node.children.clone());
+                file_count += 1;
             }
         }
-        None
+        file_count
     }
 }
 

@@ -15,7 +15,7 @@ use std::{
     io::{Error, ErrorKind},
     os::unix::fs::FileExt,
     sync::mpsc::{self, Sender},
-    sync::{Arc, Mutex},
+    sync::{Arc, RwLock},
     thread,
     time::{Duration, UNIX_EPOCH},
     u64, vec,
@@ -27,7 +27,7 @@ mod file_tree;
 mod lfu_cache;
 use credential_store::CredentialStore;
 use file_downloader::{get_app_mime_type, DownloadMessage, FileDownloader};
-use file_tree::{topological_sort, FileMetadata, FileNode, FileTree, FileTreeIterator};
+use file_tree::{topological_sort, FileMetadata, FileNode, FileTree};
 use lfu_cache::LFUFileCache;
 
 const TTL: Duration = Duration::from_secs(60); // 1 minute
@@ -44,7 +44,7 @@ struct DriveFS {
     credential_store: Arc<CredentialStore>,
     google_workspace_file_size_map: HashMap<String, u64>,
     file_tree: FileTree,
-    file_cache: Arc<Mutex<LFUFileCache>>,
+    file_cache: Arc<RwLock<LFUFileCache>>,
     file_downloader: FileDownloader,
     request_channel: Sender<DownloadMessage>,
 }
@@ -137,13 +137,10 @@ impl DriveFS {
             root.children.len()
         );
 
-        let mut tree_iterator = FileTreeIterator::new(Some(0));
-
-        let mut file_count = 0;
-        while tree_iterator.next(&file_tree).is_some() {
-            file_count += 1;
-        }
-        log::debug!("Iterating over file tree found {} files", file_count);
+        log::debug!(
+            "Iterating over file tree found {} files",
+            file_tree.num_files()
+        );
 
         let (request_channel, req_rx) = mpsc::channel();
 
@@ -169,7 +166,7 @@ impl DriveFS {
             ));
         }
 
-        let file_cache = Arc::new(Mutex::new(cache));
+        let file_cache = Arc::new(RwLock::new(cache));
 
         let file_cache_clone = Arc::clone(&file_cache);
         let logical_cores = thread::available_parallelism()
@@ -199,15 +196,15 @@ impl DriveFS {
         let file_cache_arc = Arc::clone(&self.file_cache);
         thread::spawn(move || loop {
             log::debug!("Saving cache state");
-            if let Ok(file_cache) = file_cache_arc.lock() {
+            if let Ok(file_cache) = file_cache_arc.read() {
                 if let Err(err) = file_cache.save_state() {
                     log::error!("Failed to save file cache state: {err}");
                 };
                 drop(file_cache);
-                thread::sleep(SAVE_CACHE_INTERVAL);
             } else {
                 log::error!("Failed to acquire file cache lock");
             }
+            thread::sleep(SAVE_CACHE_INTERVAL);
         });
     }
 
@@ -251,16 +248,15 @@ fn get_all_files(drive_client: &Drive, query: String) -> Result<Vec<File>, Error
 
 fn get_file_size(
     credentials: &Credentials,
-    file_id: &String,
-    mime_type: &String,
+    file_id: &str,
+    mime_type: &str,
 ) -> Result<u64, Box<dyn std::error::Error>> {
     let base_url = format!(
         "https://www.googleapis.com/drive/v3/files/{}/export",
         file_id
     );
 
-    let url =
-        reqwest::Url::parse_with_params(base_url.as_str(), &[("mimeType", mime_type.as_str())])?;
+    let url = reqwest::Url::parse_with_params(base_url.as_str(), &[("mimeType", mime_type)])?;
 
     let res = reqwest::blocking::Client::new()
         .request(reqwest::Method::HEAD, url)
@@ -415,7 +411,7 @@ impl Filesystem for DriveFS {
         log::debug!("Read request for inode {ino} at offset {offset} with size {size}");
         if let Some(node) = self.file_tree.get_node_at((ino - 1) as usize) {
             let file_cache_arc = Arc::clone(&self.file_cache);
-            let Ok(mut file_cache) = file_cache_arc.lock() else {
+            let Ok(mut file_cache) = file_cache_arc.write() else {
                 log::error!("Failed to acquire file cache lock");
                 return reply.error(EIO);
             };

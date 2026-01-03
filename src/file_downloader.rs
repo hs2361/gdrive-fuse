@@ -1,5 +1,6 @@
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, RANGE};
+use std::sync::RwLock;
 use std::{
     cmp::min,
     collections::HashMap,
@@ -132,7 +133,7 @@ pub struct FileDownloader {
     credential_store: Arc<CredentialStore>,
     http_client: Arc<Client>,
     request_channel: Arc<Mutex<Receiver<DownloadMessage>>>,
-    file_cache: Arc<Mutex<LFUFileCache>>,
+    file_cache: Arc<RwLock<LFUFileCache>>,
 }
 
 struct FileStreamer {
@@ -241,7 +242,7 @@ impl FileDownloader {
         n_threads: usize,
         credential_store: Arc<CredentialStore>,
         request_channel: Receiver<DownloadMessage>,
-        file_cache: Arc<Mutex<LFUFileCache>>,
+        file_cache: Arc<RwLock<LFUFileCache>>,
     ) -> FileDownloader {
         let request_channel = Arc::new(Mutex::new(request_channel));
         let http_client = Arc::new(Client::new());
@@ -358,7 +359,7 @@ impl FileDownloader {
                                     );
                             } else {
                                 // Cache the bytes and start background download
-                                let Ok(mut file_cache) = file_cache_mutex.lock() else {
+                                let Ok(mut file_cache) = file_cache_mutex.write() else {
                                     log::error!("Failed to acquire file cache lock");
                                     continue;
                                 };
@@ -420,7 +421,7 @@ impl FileDownloader {
                                         let chunk_len = chunk_bytes.len() as u64;
 
                                         // Cache the chunk and update state
-                                        let Ok(mut cache) = file_cache_mutex.lock() else {
+                                        let Ok(mut cache) = file_cache_mutex.write() else {
                                             log::error!(
                                                 "Worker {thread_id} failed to acquire file cache lock",
                                             );

@@ -103,10 +103,10 @@ impl CredentialStore {
                     );
                 };
                 drop(cred);
-                thread::sleep(CREDENTIAL_REFRESH_INTERVAL);
             } else {
                 log::error!("Failed to acquire credentials lock");
             }
+            thread::sleep(CREDENTIAL_REFRESH_INTERVAL);
         });
     }
 }
