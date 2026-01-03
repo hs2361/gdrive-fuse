@@ -10,7 +10,7 @@ use std::cmp::min;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::fs::FileExt;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 use std::{thread, vec};
@@ -53,7 +53,6 @@ struct DriveFS {
     file_cache: Arc<Mutex<LFUFileCache>>,
     file_downloader: FileDownloader,
     request_channel: Sender<DownloadMessage>,
-    file_bytes_channel: Receiver<Vec<u8>>,
 }
 
 fn get_all_files(drive_client: &Drive, query: String) -> Vec<File> {
@@ -172,7 +171,6 @@ impl DriveFS {
         println!("Walking file tree found {} files", file_count);
 
         let (req_tx, req_rx) = mpsc::channel();
-        let (file_bytes_tx, file_bytes_rx) = mpsc::channel();
 
         let file_cache = Arc::new(Mutex::new(
             LFUFileCache::with_capacity("/home/harsh/.drivefs/cache/".to_string(), CACHE_CAPACITY)
@@ -184,13 +182,8 @@ impl DriveFS {
             .map(|n| n.get())
             .unwrap_or(1);
 
-        let file_downloader = FileDownloader::new(
-            logical_cores * 2,
-            &credentials,
-            req_rx,
-            file_bytes_tx,
-            file_cache_clone,
-        );
+        let file_downloader =
+            FileDownloader::new(logical_cores * 2, &credentials, req_rx, file_cache_clone);
 
         DriveFS {
             credentials,
@@ -199,7 +192,6 @@ impl DriveFS {
             file_cache,
             file_downloader,
             request_channel: req_tx,
-            file_bytes_channel: file_bytes_rx,
         }
     }
 
@@ -427,6 +419,7 @@ impl Filesystem for DriveFS {
                 }
             }
 
+            let (file_bytes_tx, file_bytes_rx) = mpsc::channel();
             self.request_channel
                 .send(DownloadMessage {
                     file_id: node.id.clone(),
@@ -434,15 +427,23 @@ impl Filesystem for DriveFS {
                     size,
                     mime_type,
                     file_size,
+                    response_channel: file_bytes_tx,
                 })
                 .unwrap();
 
-            let file_bytes = self.file_bytes_channel.recv().unwrap();
-            reply.data(&file_bytes);
-            println!(
-                "Served read request with payload of {} bytes",
-                file_bytes.len()
-            );
+            thread::spawn(move || match file_bytes_rx.recv() {
+                Ok(bytes) => {
+                    println!("Reply served {} bytes", bytes.len());
+                    if bytes.is_empty() {
+                        reply.error(libc::EIO);
+                    } else {
+                        reply.data(&bytes);
+                    }
+                }
+                Err(_) => {
+                    reply.error(libc::EIO);
+                }
+            });
         } else {
             println!("Returning ENOENT for read req");
             reply.error(ENOENT);
