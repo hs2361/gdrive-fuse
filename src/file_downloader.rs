@@ -3,7 +3,7 @@ use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, RANGE};
 use std::cmp::min;
 use std::collections::HashMap;
-use std::error::Error;
+use std::io::{Error, ErrorKind};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -34,7 +34,7 @@ fn download_drive_file_range(
     access_token: &str,
     offset: i64,
     length: u32,
-) -> Result<Vec<u8>, Box<dyn Error>> {
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     // Calculate end position (Range header uses inclusive end)
     let end = offset + (length as i64) - 1;
 
@@ -70,7 +70,7 @@ fn export_drive_file_range(
     export_mime_type: &str,
     offset: i64,
     length: u32,
-) -> Result<Vec<u8>, Box<dyn Error>> {
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let end = offset + (length as i64) - 1;
 
     let url = format!(
@@ -141,7 +141,7 @@ struct FileStreamer {
 }
 
 impl FileStreamer {
-    fn next(&self, client: &Client, start: u64) -> Result<Vec<u8>, Box<dyn Error>> {
+    fn next(&self, client: &Client, start: u64) -> Result<Vec<u8>, Error> {
         let is_workspace_file = self.mime_type.starts_with(GOOGLE_WORKSPACE_MIME_PREFIX);
 
         let current_offset = start;
@@ -151,7 +151,7 @@ impl FileStreamer {
             return Ok(Vec::new());
         }
 
-        let chunk = if is_workspace_file {
+        let chunk_res = if is_workspace_file {
             let app_name = self
                 .mime_type
                 .split(GOOGLE_WORKSPACE_MIME_PREFIX)
@@ -166,7 +166,7 @@ impl FileStreamer {
                 export_mime_type,
                 current_offset as i64,
                 chunk_size as u32,
-            )?
+            )
         } else {
             download_drive_file_range(
                 client,
@@ -174,19 +174,30 @@ impl FileStreamer {
                 self.access_token.as_str(),
                 current_offset as i64,
                 chunk_size as u32,
-            )?
+            )
         };
 
-        let new_offset = current_offset + chunk.len() as u64;
-        println!(
-            "Downloaded chunk: {} bytes, progress: {}/{} bytes ({:.1}%)",
-            chunk.len(),
-            new_offset,
-            self.file_size,
-            (new_offset as f64 / self.file_size as f64) * 100.0
-        );
+        match chunk_res {
+            Ok(chunk) => {
+                let new_offset = current_offset + chunk.len() as u64;
+                log::debug!(
+                    "Downloaded chunk: {} bytes, progress: {}/{} bytes ({:.1}%)",
+                    chunk.len(),
+                    new_offset,
+                    self.file_size,
+                    (new_offset as f64 / self.file_size as f64) * 100.0
+                );
 
-        Ok(chunk)
+                Ok(chunk)
+            }
+
+            Err(err) => {
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    format!("Failed to download chunk: {err}"),
+                ));
+            }
+        }
     }
 }
 
@@ -194,12 +205,34 @@ impl FileStreamer {
 fn get_file_state(
     file_states: &Arc<Mutex<HashMap<String, Arc<Mutex<FileDownloadState>>>>>,
     file_id: &str,
-) -> Arc<Mutex<FileDownloadState>> {
-    let mut states = file_states.lock().unwrap();
-    states
+) -> Result<Arc<Mutex<FileDownloadState>>, Error> {
+    let Ok(mut states) = file_states.lock() else {
+        return Err(Error::new(
+            ErrorKind::Other,
+            "Failed to acquire file states lock",
+        ));
+    };
+
+    Ok(states
         .entry(file_id.to_string())
         .or_insert_with(|| Arc::new(Mutex::new(FileDownloadState::new())))
-        .clone()
+        .clone())
+}
+
+/// Clean up file state after background download completes
+fn cleanup_file_state(
+    file_states: &Arc<Mutex<HashMap<String, Arc<Mutex<FileDownloadState>>>>>,
+    file_id: &str,
+) -> Result<(), Error> {
+    let Ok(mut states) = file_states.lock() else {
+        return Err(Error::new(
+            ErrorKind::Other,
+            "Failed to acquire file states lock",
+        ));
+    };
+
+    states.remove(file_id);
+    Ok(())
 }
 
 impl FileDownloader {
@@ -224,15 +257,6 @@ impl FileDownloader {
         }
     }
 
-    /// Clean up file state after background download completes
-    fn cleanup_file_state(
-        file_states: &Arc<Mutex<HashMap<String, Arc<Mutex<FileDownloadState>>>>>,
-        file_id: &str,
-    ) {
-        let mut states = file_states.lock().unwrap();
-        states.remove(file_id);
-    }
-
     pub fn start_workers(&self) {
         for thread_id in 0..self.n_threads {
             let file_states = Arc::clone(&self.file_download_states);
@@ -244,22 +268,33 @@ impl FileDownloader {
             thread::spawn(move || {
                 loop {
                     // Receive the next download request
-                    let download_msg = {
-                        let rx = rx_mutex.lock().unwrap();
-                        rx.recv().unwrap()
+                    let Ok(rx_mutex) = rx_mutex.lock() else {
+                        log::error!("Failed to acquire rx lock");
+                        continue;
                     };
+
+                    let Ok(download_msg) = rx_mutex.recv() else {
+                        log::error!("Failed to receive download request");
+                        continue;
+                    };
+                    drop(rx_mutex);
 
                     let file_id = download_msg.file_id.clone();
                     let mime_type = download_msg.mime_type.clone();
                     let is_workspace_file = mime_type.starts_with(GOOGLE_WORKSPACE_MIME_PREFIX);
 
-                    println!(
-                        "Worker {} processing file {} (MIME: {}, workspace: {})",
-                        thread_id, file_id, mime_type, is_workspace_file
+                    log::debug!(
+                        "Worker {thread_id} processing file {file_id} (MIME: {mime_type}, workspace: {is_workspace_file})",
                     );
 
                     // Get the per-file state lock (short global lock)
-                    let file_state = get_file_state(&file_states, &file_id);
+                    let Ok(file_state) = get_file_state(&file_states, &file_id) else {
+                        log::error!("Failed to get file download state");
+                        if download_msg.response_channel.send(Vec::new()).is_err() {
+                            log::error!("Failed to send download response back to reader");
+                        }
+                        continue;
+                    };
 
                     // Download the requested range (no lock held during network I/O)
                     let range_result = if is_workspace_file {
@@ -292,59 +327,77 @@ impl FileDownloader {
                             let num_bytes = requested_bytes.len();
 
                             // Send the requested bytes immediately to unblock the client
-                            download_msg
+                            if download_msg
                                 .response_channel
                                 .send(requested_bytes.clone())
-                                .unwrap();
-
-                            println!(
-                                "Worker {} sent {} bytes for immediate response",
-                                thread_id, num_bytes
-                            );
-
-                            // Now acquire the per-file lock to coordinate caching
-                            let should_start_background = {
-                                let mut state = file_state.lock().unwrap();
-
-                                if state.background_in_progress {
-                                    // Another thread is already downloading this file
-                                    // Don't cache these bytes as they might overlap or cause issues
-                                    println!(
-                                        "Worker {} skipping cache - background download already in progress for {}",
-                                        thread_id, file_id
-                                    );
-                                    false
-                                } else {
-                                    // We're the first - cache the bytes and start background download
-                                    {
-                                        let mut file_cache = file_cache_mutex.lock().unwrap();
-                                        file_cache.set(file_id.clone(), &requested_bytes);
-                                    }
-                                    state.cached_bytes =
-                                        (download_msg.offset as u64) + (num_bytes as u64);
-                                    state.background_in_progress = true;
-                                    true
-                                }
+                                .is_err()
+                            {
+                                log::error!("Failed to send download response back to reader");
+                                continue;
                             };
 
+                            log::debug!(
+                                "Worker {thread_id} sent {num_bytes} bytes for immediate response",
+                            );
+
+                            // Acquire the per-file lock to coordinate caching
+                            let mut should_start_background = false;
+
+                            let Ok(mut state) = file_state.lock() else {
+                                log::debug!("Failed to acquire file state lock");
+                                continue;
+                            };
+
+                            if state.background_in_progress {
+                                // Another thread is already downloading this file
+                                // Don't cache these bytes as they might overlap or cause issues
+                                log::debug!(
+                                        "Worker {thread_id} skipping cache - background download already in progress for {file_id}",
+                                    );
+                            } else {
+                                // Cache the bytes and start background download
+                                let Ok(mut file_cache) = file_cache_mutex.lock() else {
+                                    log::error!("Failed to acquire file cache lock");
+                                    continue;
+                                };
+
+                                if let Err(err) = file_cache.set(file_id.clone(), &requested_bytes)
+                                {
+                                    log::error!("Failed to cache initial response: {err}");
+                                    continue;
+                                };
+                                drop(file_cache);
+                                state.cached_bytes =
+                                    (download_msg.offset as u64) + (num_bytes as u64);
+                                state.background_in_progress = true;
+                                should_start_background = true;
+                            }
+
+                            drop(state);
                             if !should_start_background {
+                                if download_msg.response_channel.send(Vec::new()).is_err() {
+                                    log::error!("Failed to send download response back to reader");
+                                }
                                 continue;
                             }
 
                             // Check if we've already downloaded the whole file
                             let end_offset = (download_msg.offset as u64) + (num_bytes as u64);
                             if end_offset >= download_msg.file_size {
-                                println!(
-                                    "Worker {} file {} fully downloaded with initial request",
-                                    thread_id, file_id
+                                log::debug!(
+                                    "Worker {thread_id} file {file_id} fully downloaded with initial request",
                                 );
-                                Self::cleanup_file_state(&file_states, &file_id);
+                                if cleanup_file_state(&file_states, &file_id).is_err() {
+                                    log::error!("Failed to cleanup file state");
+                                };
                                 continue;
                             }
 
-                            println!(
+                            log::debug!(
                                 "Worker {} starting background download from byte {} to {}",
-                                thread_id, end_offset, download_msg.file_size
+                                thread_id,
+                                end_offset,
+                                download_msg.file_size
                             );
 
                             let streamer = FileStreamer {
@@ -366,43 +419,60 @@ impl FileDownloader {
                                         let chunk_len = chunk_bytes.len() as u64;
 
                                         // Cache the chunk and update state
-                                        {
-                                            let mut cache = file_cache_mutex.lock().unwrap();
-                                            cache.set(file_id.clone(), &chunk_bytes);
-                                        }
+                                        let Ok(mut cache) = file_cache_mutex.lock() else {
+                                            log::error!(
+                                                "Worker {thread_id} failed to acquire file cache lock",
+                                            );
+                                            break;
+                                        };
 
-                                        {
-                                            let mut state = file_state.lock().unwrap();
-                                            state.cached_bytes = current_offset + chunk_len;
+                                        if let Err(err) = cache.set(file_id.clone(), &chunk_bytes) {
+                                            log::error!(
+                                                "Worker {thread_id} failed to cache chunk: {err}",
+                                            );
+                                            break;
                                         }
+                                        drop(cache);
+
+                                        let Ok(mut state) = file_state.lock() else {
+                                            log::error!(
+                                                "Worker {thread_id} failed to acquire file state lock",
+                                            );
+                                            break;
+                                        };
+                                        state.cached_bytes = current_offset + chunk_len;
 
                                         current_offset += chunk_len;
                                     }
                                     Err(err) => {
-                                        println!(
+                                        log::error!(
                                             "Worker {} failed to download chunk for {}: {}",
-                                            thread_id, file_id, err
+                                            thread_id,
+                                            file_id,
+                                            err
                                         );
                                         break;
                                     }
                                 }
                             }
 
-                            println!(
-                                "Worker {} completed background download for {}",
-                                thread_id, file_id
+                            log::debug!(
+                                "Worker {thread_id} completed background download for {file_id}",
                             );
 
                             // Clean up the file state now that download is complete
-                            Self::cleanup_file_state(&file_states, &file_id);
+                            if cleanup_file_state(&file_states, &file_id).is_err() {
+                                log::error!("Failed to cleanup file state");
+                            };
                         }
                         Err(err) => {
-                            println!(
-                                "Worker {} failed to download range for {}: {}",
-                                thread_id, file_id, err
+                            log::debug!(
+                                "Worker {thread_id} failed to download range for {file_id}: {err}",
                             );
                             // Send empty vec to unblock the waiting read operation
-                            download_msg.response_channel.send(Vec::new()).unwrap();
+                            if download_msg.response_channel.send(Vec::new()).is_err() {
+                                log::error!("Failed to send download response back to reader");
+                            }
                         }
                     }
                 }

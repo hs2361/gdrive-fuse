@@ -2,6 +2,7 @@
 // generalized from https://sachanganesh.com/programming/graph-tree-traversals-in-rust/
 use std::{
     collections::{HashMap, VecDeque},
+    io::{Error, ErrorKind},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -78,10 +79,6 @@ impl FileNode {
     pub fn add_child(&mut self, index: usize) {
         self.children.push(index);
     }
-
-    // pub fn delete_child(&mut self, index: usize) {
-    //     self.children.swap_remove(index);
-    // }
 }
 
 pub struct FileTree {
@@ -97,15 +94,21 @@ impl FileTree {
         }
     }
 
-    pub fn add_node(&mut self, node: FileNode, add_under_root: bool) -> usize {
+    pub fn add_node(&mut self, node: FileNode, add_under_root: bool) -> Result<usize, Error> {
         self.arena.push(Some(node));
         let child_node_index = self.arena.len() - 1;
         if add_under_root {
-            self.get_node_at_mut(self.root_node_index)
-                .unwrap()
-                .add_child(child_node_index);
+            if let Some(node) = self.get_node_at_mut(self.root_node_index) {
+                node.add_child(child_node_index);
+            } else {
+                return Err(Error::new(
+                    ErrorKind::NotFound,
+                    "Failed to find root node in file tree",
+                ));
+            }
         }
-        child_node_index
+
+        Ok(child_node_index)
     }
 
     pub fn find_node_index(&self, id: &String) -> Option<usize> {
@@ -133,56 +136,22 @@ impl FileTree {
         None
     }
 
-    // pub fn find_node(&self, id: &String) -> Option<&FileNode> {
-    //     for node in &self.arena {
-    //         if node.is_some() && node.as_ref().unwrap().id == *id {
-    //             return node.as_ref();
-    //         }
-    //     }
-    //     None
-    // }
-
-    // pub fn find_node_mut(&mut self, id: &String) -> Option<&mut FileNode> {
-    //     for node in &mut self.arena {
-    //         if node.is_some() && node.as_ref().unwrap().id == *id {
-    //             return node.as_mut();
-    //         }
-    //     }
-    //     None
-    // }
-
-    // pub fn delete_node_at(&mut self, index: usize) -> Option<FileNode> {
-    //     match self.arena.get_mut(index) {
-    //         Some(node) => node.take(),
-    //         None => None,
-    //     }
-    // }
-
-    // pub fn iter(&self, node_index: Option<usize>) -> FileTreeWalker {
-    //     println!("{:?}", self.arena);
-    //     if let Some(index) = node_index {
-    //         FileTreeWalker::new(Some(index))
-    //     } else {
-    //         FileTreeWalker::new(Some(self.root_node_index.clone()))
-    //     }
-    // }
-
     pub fn len(&self) -> usize {
         self.arena.len()
     }
 }
 
-pub struct FileTreeWalker {
+pub struct FileTreeIterator {
     unvisited_node_indices: Vec<usize>,
 }
 
-impl FileTreeWalker {
+impl FileTreeIterator {
     pub fn new(tree_root: Option<usize>) -> Self {
         match tree_root {
-            Some(root) => FileTreeWalker {
+            Some(root) => FileTreeIterator {
                 unvisited_node_indices: vec![root],
             },
-            None => FileTreeWalker {
+            None => FileTreeIterator {
                 unvisited_node_indices: vec![],
             },
         }
@@ -201,9 +170,7 @@ impl FileTreeWalker {
 
 // Kahn's algorithm for topologically sorting a DAG
 // https://www.geeksforgeeks.org/topological-sorting-indegree-based-solution/
-pub fn topological_sort(
-    id_parent_map: &HashMap<String, String>,
-) -> Result<Vec<String>, &'static str> {
+pub fn topological_sort(id_parent_map: &HashMap<String, String>) -> Result<Vec<String>, Error> {
     let mut in_degree_map: HashMap<String, usize> = HashMap::new();
 
     // compute in-degrees of all vertices
@@ -224,7 +191,12 @@ pub fn topological_sort(
 
     // keep popping vertices from the zero in-degree queue until empty
     while !zero_degree_vertices.is_empty() {
-        let node = zero_degree_vertices.pop_front().unwrap();
+        let Some(node) = zero_degree_vertices.pop_front() else {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                "No zero in-degree vertices found",
+            ));
+        };
 
         // This vertex is in topologically sorted order so add it to the result vector
         topo_sorted.push(node.clone());
@@ -244,7 +216,10 @@ pub fn topological_sort(
 
     // The result vector should have all the vertices
     if topo_sorted.len() < id_parent_map.len() {
-        return Err("Cycle detected in graph, not a DAG");
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "Cycle detected in graph, not a DAG",
+        ));
     }
 
     // Return the result vector
