@@ -1,13 +1,15 @@
-use drive_v3::Credentials;
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, RANGE};
-use std::cmp::min;
-use std::collections::HashMap;
-use std::io::{Error, ErrorKind};
-use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::{
+    cmp::min,
+    collections::HashMap,
+    io::{Error, ErrorKind},
+    sync::mpsc::{Receiver, Sender},
+    sync::{Arc, Mutex},
+    thread,
+};
 
+use crate::credential_store::CredentialStore;
 use crate::lfu_cache::LFUFileCache;
 
 const GOOGLE_WORKSPACE_MIME_PREFIX: &str = "application/vnd.google-apps.";
@@ -15,7 +17,7 @@ const CHUNK_SIZE: u64 = 10 * 1024 * 1024; // 10MB chunks for background download
 
 // https://developers.google.com/drive/api/guides/mime-types
 // https://developers.google.com/drive/api/guides/ref-export-formats
-fn get_app_mime_type(app_name: &str) -> &'static str {
+pub fn get_app_mime_type(app_name: &str) -> &'static str {
     match app_name {
         "document" => "application/pdf",
         "spreadsheet" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -127,7 +129,7 @@ impl FileDownloadState {
 pub struct FileDownloader {
     n_threads: usize,
     file_download_states: Arc<Mutex<HashMap<String, Arc<Mutex<FileDownloadState>>>>>,
-    access_token: Arc<String>,
+    credential_store: Arc<CredentialStore>,
     http_client: Arc<Client>,
     request_channel: Arc<Mutex<Receiver<DownloadMessage>>>,
     file_cache: Arc<Mutex<LFUFileCache>>,
@@ -135,13 +137,12 @@ pub struct FileDownloader {
 
 struct FileStreamer {
     pub file_id: String,
-    pub access_token: String,
     pub mime_type: String,
     pub file_size: u64,
 }
 
 impl FileStreamer {
-    fn next(&self, client: &Client, start: u64) -> Result<Vec<u8>, Error> {
+    fn next(&self, client: &Client, access_token: &str, start: u64) -> Result<Vec<u8>, Error> {
         let is_workspace_file = self.mime_type.starts_with(GOOGLE_WORKSPACE_MIME_PREFIX);
 
         let current_offset = start;
@@ -162,7 +163,7 @@ impl FileStreamer {
             export_drive_file_range(
                 client,
                 self.file_id.as_str(),
-                self.access_token.as_str(),
+                &access_token,
                 export_mime_type,
                 current_offset as i64,
                 chunk_size as u32,
@@ -171,7 +172,7 @@ impl FileStreamer {
             download_drive_file_range(
                 client,
                 self.file_id.as_str(),
-                self.access_token.as_str(),
+                &access_token,
                 current_offset as i64,
                 chunk_size as u32,
             )
@@ -238,19 +239,18 @@ fn cleanup_file_state(
 impl FileDownloader {
     pub fn new(
         n_threads: usize,
-        credentials: &Credentials,
+        credential_store: Arc<CredentialStore>,
         request_channel: Receiver<DownloadMessage>,
         file_cache: Arc<Mutex<LFUFileCache>>,
     ) -> FileDownloader {
         let request_channel = Arc::new(Mutex::new(request_channel));
-        let access_token = Arc::new(credentials.access_token.access_token.clone());
         let http_client = Arc::new(Client::new());
         let file_download_states = Arc::new(Mutex::new(HashMap::new()));
 
         FileDownloader {
             n_threads,
             file_download_states,
-            access_token,
+            credential_store,
             http_client,
             request_channel,
             file_cache,
@@ -262,7 +262,7 @@ impl FileDownloader {
             let file_states = Arc::clone(&self.file_download_states);
             let rx_mutex = Arc::clone(&self.request_channel);
             let http_client = Arc::clone(&self.http_client);
-            let access_token = Arc::clone(&self.access_token);
+            let credential_store = Arc::clone(&self.credential_store);
             let file_cache_mutex = Arc::clone(&self.file_cache);
 
             thread::spawn(move || {
@@ -287,7 +287,7 @@ impl FileDownloader {
                         "Worker {thread_id} processing file {file_id} (MIME: {mime_type}, workspace: {is_workspace_file})",
                     );
 
-                    // Get the per-file state lock (short global lock)
+                    // Get the per-file state lock
                     let Ok(file_state) = get_file_state(&file_states, &file_id) else {
                         log::error!("Failed to get file download state");
                         if download_msg.response_channel.send(Vec::new()).is_err() {
@@ -295,6 +295,8 @@ impl FileDownloader {
                         }
                         continue;
                     };
+
+                    let access_token = credential_store.get_credentials().access_token.access_token;
 
                     // Download the requested range (no lock held during network I/O)
                     let range_result = if is_workspace_file {
@@ -402,7 +404,6 @@ impl FileDownloader {
 
                             let streamer = FileStreamer {
                                 file_id: file_id.clone(),
-                                access_token: access_token.to_string(),
                                 mime_type,
                                 file_size: download_msg.file_size,
                             };
@@ -410,7 +411,7 @@ impl FileDownloader {
                             let mut current_offset = end_offset;
 
                             while current_offset < download_msg.file_size {
-                                match streamer.next(&http_client, current_offset) {
+                                match streamer.next(&http_client, &access_token, current_offset) {
                                     Ok(chunk_bytes) => {
                                         if chunk_bytes.is_empty() {
                                             break;

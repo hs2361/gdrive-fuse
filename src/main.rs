@@ -7,24 +7,32 @@ use fuser::{
 };
 use libc::{EINVAL, EIO, ENOENT, ENOTSUP};
 use log;
-use std::cmp::min;
-use std::collections::HashMap;
-use std::ffi::OsStr;
-use std::io::{Error, ErrorKind};
-use std::os::unix::fs::FileExt;
-use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, UNIX_EPOCH};
-use std::{env, thread, u64, vec};
+use std::{
+    cmp::min,
+    collections::HashMap,
+    env,
+    ffi::OsStr,
+    io::{Error, ErrorKind},
+    os::unix::fs::FileExt,
+    sync::mpsc::{self, Sender},
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, UNIX_EPOCH},
+    u64, vec,
+};
 
+mod credential_store;
 mod file_downloader;
 mod file_tree;
 mod lfu_cache;
-use file_downloader::{DownloadMessage, FileDownloader};
+use credential_store::CredentialStore;
+use file_downloader::{get_app_mime_type, DownloadMessage, FileDownloader};
 use file_tree::{topological_sort, FileMetadata, FileNode, FileTree, FileTreeIterator};
 use lfu_cache::LFUFileCache;
 
 const TTL: Duration = Duration::from_secs(60); // 1 minute
+const SAVE_CACHE_INTERVAL: Duration = Duration::from_secs(60);
+const API_FIELDS: &str = "nextPageToken,files(name, parents, id, size, viewedByMeTime, createdTime, modifiedTime, ownedByMe, mimeType)";
 const DEFAULT_PARENT: &str = "My Drive";
 const DEFAULT_PERMS: u16 = 0o550; // r-xr-x---
 const MAX_PAGE_SIZE: i64 = 1000;
@@ -32,24 +40,8 @@ const CACHE_CAPACITY: usize = 100;
 const GOOGLE_WORKSPACE_MIME_PREFIX: &str = "application/vnd.google-apps.";
 const FOLDER_MIME_TYPE: &str = "application/vnd.google-apps.folder";
 
-// https://developers.google.com/drive/api/guides/mime-types
-// https://developers.google.com/drive/api/guides/ref-export-formats
-fn get_app_mime_type(app_name: &str) -> &'static str {
-    match app_name {
-        // "document" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "document" => "application/pdf",
-        "spreadsheet" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "presentation" => {
-            "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-        }
-        "drawing" => "image/svg+xml",
-        "script+json" => "application/vnd.google-apps.script+json",
-        &_ => "application/pdf",
-    }
-}
-
 struct DriveFS {
-    credentials: Credentials,
+    credential_store: Arc<CredentialStore>,
     google_workspace_file_size_map: HashMap<String, u64>,
     file_tree: FileTree,
     file_cache: Arc<Mutex<LFUFileCache>>,
@@ -57,38 +49,9 @@ struct DriveFS {
     request_channel: Sender<DownloadMessage>,
 }
 
-fn get_all_files(drive_client: &Drive, query: String) -> Result<Vec<File>, Error> {
-    let mut next_page_token = Some(String::new());
-    let mut file_list: Vec<File> = vec![];
-
-    let client = drive_client
-    .files
-    .list()
-    .include_items_from_all_drives(false)
-    .page_size(MAX_PAGE_SIZE)
-    .fields(
-        "nextPageToken,files(name, parents, id, size, viewedByMeTime, createdTime, modifiedTime, ownedByMe, mimeType)",
-    ) // Set what fields will be returned
-    //TODO: exportLinks
-    .q(query);
-
-    while let Some(ref page_token) = next_page_token {
-        if let Ok(response) = client.clone().page_token(page_token).execute() {
-            next_page_token = response.next_page_token;
-            if let Some(files) = response.files {
-                file_list.extend(files);
-            } else {
-                break;
-            }
-        }
-    }
-
-    Ok(file_list)
-}
-
 impl DriveFS {
-    fn new(credentials: Credentials) -> Result<DriveFS, Error> {
-        let drive_client = Drive::new(&credentials);
+    fn new(credential_store: CredentialStore) -> Result<DriveFS, Error> {
+        let drive_client = Drive::new(&credential_store.get_credentials());
         let query = String::from("not trashed");
         let files = get_all_files(&drive_client, query)?;
 
@@ -133,7 +96,7 @@ impl DriveFS {
                 if let Some(index) = file_tree.find_node_index(&parent) {
                     parent_index = index;
                 } else {
-                    log::error!("Parent node not found with ID {}!", &parent);
+                    log::warn!("Parent node not found with ID {}!", &parent);
                     parent_index = 0;
                 }
 
@@ -213,11 +176,17 @@ impl DriveFS {
             .map(|n| n.get())
             .unwrap_or(1);
 
-        let file_downloader =
-            FileDownloader::new(logical_cores * 2, &credentials, req_rx, file_cache_clone);
+        let credential_store_arc = Arc::new(credential_store);
+        let credential_store_clone = Arc::clone(&credential_store_arc);
+        let file_downloader = FileDownloader::new(
+            logical_cores * 2,
+            credential_store_clone,
+            req_rx,
+            file_cache_clone,
+        );
 
         Ok(DriveFS {
-            credentials,
+            credential_store: credential_store_arc,
             google_workspace_file_size_map: HashMap::new(),
             file_tree,
             file_cache,
@@ -235,7 +204,7 @@ impl DriveFS {
                     log::error!("Failed to save file cache state: {err}");
                 };
                 drop(file_cache);
-                thread::sleep(Duration::from_secs(60));
+                thread::sleep(SAVE_CACHE_INTERVAL);
             } else {
                 log::error!("Failed to acquire file cache lock");
             }
@@ -245,6 +214,39 @@ impl DriveFS {
     fn start_file_downloader_threads(&self) {
         self.file_downloader.start_workers();
     }
+}
+
+fn get_all_files(drive_client: &Drive, query: String) -> Result<Vec<File>, Error> {
+    let mut next_page_token = Some(String::new());
+    let mut file_list: Vec<File> = vec![];
+
+    let client = drive_client
+        .files
+        .list()
+        .include_items_from_all_drives(false)
+        .page_size(MAX_PAGE_SIZE)
+        .fields(API_FIELDS) // Set what fields will be returned
+        .q(query);
+
+    while let Some(ref page_token) = next_page_token {
+        match client.clone().page_token(page_token).execute() {
+            Ok(response) => {
+                next_page_token = response.next_page_token;
+                if let Some(files) = response.files {
+                    file_list.extend(files);
+                } else {
+                    break;
+                }
+            }
+            Err(err) => {
+                let msg = format!("Failed to fetch all files from API: {err}");
+                log::error!("{msg}");
+                return Err(Error::new(ErrorKind::Other, msg));
+            }
+        }
+    }
+
+    Ok(file_list)
 }
 
 fn get_file_size(
@@ -304,9 +306,12 @@ impl Filesystem for DriveFS {
                                     .split(GOOGLE_WORKSPACE_MIME_PREFIX)
                                     .collect::<Vec<&str>>()[1];
                                 let export_mime_type = get_app_mime_type(app_name).to_string();
-                                let exported_file_size =
-                                    get_file_size(&self.credentials, &file_id, &export_mime_type)
-                                        .unwrap_or(10_u64.pow(6));
+                                let exported_file_size = get_file_size(
+                                    &self.credential_store.get_credentials(),
+                                    &file_id,
+                                    &export_mime_type,
+                                )
+                                .unwrap_or(10_u64.pow(6));
                                 self.google_workspace_file_size_map
                                     .insert(child_node.id.clone(), exported_file_size);
                                 file_size = exported_file_size;
@@ -360,9 +365,12 @@ impl Filesystem for DriveFS {
                             .split(GOOGLE_WORKSPACE_MIME_PREFIX)
                             .collect::<Vec<&str>>()[1];
                         let export_mime_type = get_app_mime_type(app_name).to_string();
-                        let exported_file_size =
-                            get_file_size(&self.credentials, &file_id, &export_mime_type)
-                                .unwrap_or(10_u64.pow(6));
+                        let exported_file_size = get_file_size(
+                            &self.credential_store.get_credentials(),
+                            &file_id,
+                            &export_mime_type,
+                        )
+                        .unwrap_or(10_u64.pow(6));
                         self.google_workspace_file_size_map
                             .insert(node.id.clone(), exported_file_size);
                         file_size = exported_file_size;
@@ -541,7 +549,7 @@ impl Filesystem for DriveFS {
 }
 
 fn main() -> Result<(), Error> {
-    let matches = Command::new("gdrivefs")
+    let matches = Command::new("drivefs")
         .version(crate_version!())
         .author("Harsh Sharma")
         .arg(
@@ -568,31 +576,10 @@ fn main() -> Result<(), Error> {
         .get_one::<String>("MOUNT_POINT")
         .expect("Argument MOUNT_POINT is required");
 
-    // let client_secrets_path = "src/client_secret.json";
-    let stored_cred_path = "src/credentials.json";
-
-    let scopes: [&'static str; 1] = ["https://www.googleapis.com/auth/drive"];
-
     env_logger::init();
 
-    // let mut credentials =
-    //     Credentials::from_client_secrets_file(&client_secrets_path, &scopes).unwrap();
-
-    // credentials.store(&stored_cred_path).unwrap();
-    let mut credentials = Credentials::from_file(stored_cred_path, &scopes)
-        .expect(format!("Failed to load credentials from file {}", stored_cred_path).as_str());
-
-    // Refresh the credentials if they have expired
-    if !credentials.are_valid() {
-        credentials
-            .refresh()
-            .expect("Failed to refresh credentials");
-
-        // Save them so we don't have to refresh them every time
-        if let Err(err) = credentials.store(&stored_cred_path) {
-            log::warn!("Failed to save refreshed credentials at {stored_cred_path}: {err}");
-        }
-    }
+    let credentials_store = CredentialStore::new()?;
+    credentials_store.refresh_credentials();
 
     let mut options = vec![MountOption::RO, MountOption::FSName("drivefs".to_string())];
     if matches.get_flag("auto-unmount") {
@@ -603,7 +590,7 @@ fn main() -> Result<(), Error> {
         options.push(MountOption::AllowRoot);
     }
 
-    let fs = DriveFS::new(credentials)?;
+    let fs = DriveFS::new(credentials_store)?;
     fs.start_file_downloader_threads();
     fs.start_bg_cache_state_worker();
 

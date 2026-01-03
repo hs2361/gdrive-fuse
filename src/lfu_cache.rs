@@ -5,13 +5,15 @@ use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json;
-use std::borrow::Borrow;
-use std::collections::HashMap;
-use std::fmt::{self, Debug};
-use std::fs::{self, remove_file, File, OpenOptions};
-use std::io::{BufReader, Error, ErrorKind, Write};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::{
+    borrow::Borrow,
+    collections::HashMap,
+    fmt::{self, Debug},
+    fs::{self, remove_file, File, OpenOptions},
+    io::{BufReader, Error, ErrorKind, Write},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheEntry {
