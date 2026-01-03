@@ -18,7 +18,6 @@ use std::{
     sync::{Arc, RwLock},
     thread,
     time::{Duration, UNIX_EPOCH},
-    u64, vec,
 };
 
 mod credential_store;
