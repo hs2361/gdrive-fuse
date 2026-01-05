@@ -210,6 +210,60 @@ impl DriveFS {
     fn start_file_downloader_threads(&self) {
         self.file_downloader.start_workers();
     }
+
+    fn file_attr_for_node(&mut self, node: &FileNode, inode: usize) -> FileAttr {
+        let mut file_type = FileType::RegularFile;
+        let mime_type = node.metadata.mime_type.clone();
+        let mut file_size = node.metadata.size;
+
+        if mime_type.starts_with(GOOGLE_WORKSPACE_MIME_PREFIX) {
+            if mime_type == FOLDER_MIME_TYPE {
+                file_type = FileType::Directory;
+            } else {
+                let file_id = node.id.clone();
+
+                if let Some(size) = self.google_workspace_file_size_map.get(&file_id) {
+                    file_size = *size;
+                } else {
+                    let app_name = mime_type
+                        .split(GOOGLE_WORKSPACE_MIME_PREFIX)
+                        .collect::<Vec<&str>>()[1];
+                    let export_mime_type = get_app_mime_type(app_name).to_string();
+                    let exported_file_size = get_file_size(
+                        &self.credential_store.get_credentials(),
+                        &file_id,
+                        &export_mime_type,
+                    )
+                    .unwrap_or(10_u64.pow(6));
+                    self.google_workspace_file_size_map
+                        .insert(node.id.clone(), exported_file_size);
+                    file_size = exported_file_size;
+                }
+            }
+        }
+
+        if node.metadata.mime_type == FOLDER_MIME_TYPE {
+            file_type = FileType::Directory;
+        }
+
+        FileAttr {
+            ino: inode as u64,
+            size: file_size,
+            blocks: 1,
+            atime: node.metadata.access_time, // 1970-01-01 00:00:00
+            mtime: node.metadata.last_modified_time,
+            ctime: node.metadata.last_modified_time,
+            crtime: node.metadata.creation_time,
+            kind: file_type,
+            perm: DEFAULT_PERMS,
+            nlink: 0,
+            uid: 1000,
+            gid: 1000,
+            rdev: 0,
+            flags: 0,
+            blksize: 512,
+        }
+    }
 }
 
 fn get_all_files(drive_client: &Drive, query: String) -> Result<Vec<File>, Error> {
@@ -284,55 +338,8 @@ impl Filesystem for DriveFS {
                 };
 
                 if child_node.metadata.name == name_str {
-                    let mut file_type = FileType::RegularFile;
-                    let mime_type = child_node.metadata.mime_type.clone();
-                    let mut file_size = child_node.metadata.size;
-
-                    if mime_type.starts_with(GOOGLE_WORKSPACE_MIME_PREFIX) {
-                        if mime_type == FOLDER_MIME_TYPE {
-                            file_type = FileType::Directory;
-                        } else {
-                            let file_id = child_node.id.clone();
-
-                            if let Some(size) = self.google_workspace_file_size_map.get(&file_id) {
-                                file_size = *size;
-                            } else {
-                                let app_name = mime_type
-                                    .split(GOOGLE_WORKSPACE_MIME_PREFIX)
-                                    .collect::<Vec<&str>>()[1];
-                                let export_mime_type = get_app_mime_type(app_name).to_string();
-                                let exported_file_size = get_file_size(
-                                    &self.credential_store.get_credentials(),
-                                    &file_id,
-                                    &export_mime_type,
-                                )
-                                .unwrap_or(10_u64.pow(6));
-                                self.google_workspace_file_size_map
-                                    .insert(child_node.id.clone(), exported_file_size);
-                                file_size = exported_file_size;
-                            }
-                        }
-                    }
-                    if child_node.metadata.mime_type == FOLDER_MIME_TYPE {
-                        file_type = FileType::Directory;
-                    }
-                    let node_attr = FileAttr {
-                        ino: (child_index + 1) as u64,
-                        size: file_size,
-                        blocks: 1,
-                        atime: child_node.metadata.access_time, // 1970-01-01 00:00:00
-                        mtime: child_node.metadata.last_modified_time,
-                        ctime: child_node.metadata.last_modified_time,
-                        crtime: child_node.metadata.creation_time,
-                        kind: file_type,
-                        perm: DEFAULT_PERMS,
-                        nlink: 0,
-                        uid: 1000,
-                        gid: 1000,
-                        rdev: 0,
-                        flags: 0,
-                        blksize: 512,
-                    };
+                    let child_node_copy = child_node.clone();
+                    let node_attr = self.file_attr_for_node(&child_node_copy, child_index + 1);
                     reply.entry(&TTL, &node_attr, 0);
                     return;
                 }
@@ -343,53 +350,8 @@ impl Filesystem for DriveFS {
 
     fn getattr(&mut self, _req: &Request, ino: u64, _: Option<u64>, reply: ReplyAttr) {
         if let Some(node) = self.file_tree.get_node_at((ino - 1) as usize) {
-            let mut file_type = FileType::RegularFile;
-            let mime_type = node.metadata.mime_type.clone();
-            let mut file_size = node.metadata.size;
-
-            if mime_type.starts_with(GOOGLE_WORKSPACE_MIME_PREFIX) {
-                if mime_type == FOLDER_MIME_TYPE {
-                    file_type = FileType::Directory;
-                } else {
-                    let file_id = node.id.clone();
-
-                    if let Some(size) = self.google_workspace_file_size_map.get(&file_id) {
-                        file_size = *size;
-                    } else {
-                        let app_name = mime_type
-                            .split(GOOGLE_WORKSPACE_MIME_PREFIX)
-                            .collect::<Vec<&str>>()[1];
-                        let export_mime_type = get_app_mime_type(app_name).to_string();
-                        let exported_file_size = get_file_size(
-                            &self.credential_store.get_credentials(),
-                            &file_id,
-                            &export_mime_type,
-                        )
-                        .unwrap_or(10_u64.pow(6));
-                        self.google_workspace_file_size_map
-                            .insert(node.id.clone(), exported_file_size);
-                        file_size = exported_file_size;
-                    }
-                }
-            }
-
-            let node_attr = FileAttr {
-                ino: ino,
-                size: file_size,
-                blocks: 1,
-                atime: node.metadata.access_time, // 1970-01-01 00:00:00
-                mtime: node.metadata.last_modified_time,
-                ctime: node.metadata.last_modified_time,
-                crtime: node.metadata.creation_time,
-                kind: file_type,
-                perm: DEFAULT_PERMS,
-                nlink: 0,
-                uid: 1000,
-                gid: 1000,
-                rdev: 0,
-                flags: 0,
-                blksize: 512,
-            };
+            let node_copy = node.clone();
+            let node_attr = self.file_attr_for_node(&node_copy, ino as usize);
             reply.attr(&TTL, &node_attr);
             return;
         }
@@ -455,34 +417,17 @@ impl Filesystem for DriveFS {
                 }
             }
 
-            let (file_bytes_tx, file_bytes_rx) = mpsc::channel();
-            let msg = DownloadMessage {
+            if let Err(err) = self.request_channel.send(DownloadMessage {
                 file_id: node.id.clone(),
                 offset,
                 size,
                 mime_type,
                 file_size,
-                response_channel: file_bytes_tx,
-            };
-
-            if let Err(err) = self.request_channel.send(msg) {
+                reply,
+            }) {
                 log::error!("Failed to send request to file downloader pool: {err}");
-                return reply.error(EIO);
+                return err.0.reply.error(EIO);
             }
-
-            thread::spawn(move || match file_bytes_rx.recv() {
-                Ok(bytes) => {
-                    log::debug!("Reply served {} bytes", bytes.len());
-                    if bytes.is_empty() {
-                        reply.error(libc::EIO);
-                    } else {
-                        reply.data(&bytes);
-                    }
-                }
-                Err(_) => {
-                    reply.error(libc::EIO);
-                }
-            });
         } else {
             log::error!("Replying to read request with ENOENT");
             reply.error(ENOENT);

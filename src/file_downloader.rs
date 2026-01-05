@@ -1,3 +1,5 @@
+use fuser::ReplyData;
+use libc::EIO;
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, RANGE};
 use std::sync::RwLock;
@@ -5,7 +7,7 @@ use std::{
     cmp::min,
     collections::HashMap,
     io::{Error, ErrorKind},
-    sync::mpsc::{Receiver, Sender},
+    sync::mpsc::Receiver,
     sync::{Arc, Mutex},
     thread,
 };
@@ -107,7 +109,7 @@ pub struct DownloadMessage {
     pub size: u32,
     pub mime_type: String,
     pub file_size: u64,
-    pub response_channel: Sender<Vec<u8>>,
+    pub reply: ReplyData,
 }
 
 /// Tracks the download state for a single file
@@ -291,9 +293,7 @@ impl FileDownloader {
                     // Get the per-file state lock
                     let Ok(file_state) = get_file_state(&file_states, &file_id) else {
                         log::error!("Failed to get file download state");
-                        if download_msg.response_channel.send(Vec::new()).is_err() {
-                            log::error!("Failed to send download response back to reader");
-                        }
+                        download_msg.reply.error(EIO);
                         continue;
                     };
 
@@ -330,15 +330,7 @@ impl FileDownloader {
                             let num_bytes = requested_bytes.len();
 
                             // Send the requested bytes immediately to unblock the client
-                            if download_msg
-                                .response_channel
-                                .send(requested_bytes.clone())
-                                .is_err()
-                            {
-                                log::error!("Failed to send download response back to reader");
-                                continue;
-                            };
-
+                            download_msg.reply.data(&requested_bytes);
                             log::debug!(
                                 "Worker {thread_id} sent {num_bytes} bytes for immediate response",
                             );
@@ -378,9 +370,6 @@ impl FileDownloader {
 
                             drop(state);
                             if !should_start_background {
-                                if download_msg.response_channel.send(Vec::new()).is_err() {
-                                    log::error!("Failed to send download response back to reader");
-                                }
                                 continue;
                             }
 
@@ -471,10 +460,8 @@ impl FileDownloader {
                             log::debug!(
                                 "Worker {thread_id} failed to download range for {file_id}: {err}",
                             );
-                            // Send empty vec to unblock the waiting read operation
-                            if download_msg.response_channel.send(Vec::new()).is_err() {
-                                log::error!("Failed to send download response back to reader");
-                            }
+                            // Send error to client
+                            download_msg.reply.error(EIO);
                         }
                     }
                 }

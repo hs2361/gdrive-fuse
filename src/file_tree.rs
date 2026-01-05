@@ -60,7 +60,7 @@ impl From<&File> for FileMetadata {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FileNode {
     pub id: String,
     pub metadata: FileMetadata,
